@@ -32,26 +32,35 @@ import android.os.Vibrator
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
+import android.graphics.Bitmap
+import android.graphics.BitmapShader
+import android.os.Handler
+import android.os.Looper
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-// Paleta vintage: verde carreras, crema, latón
-private val VERDE = 0xFF1F3B30.toInt()
-private val VERDE_OSCURO = 0xFF162B22.toInt()
-private val CREMA = 0xFFEADFC0.toInt()
-private val LATON = 0xFFB8923A.toInt()
-private val LATON_OSCURO = 0xFF7A5F22.toInt()
-private val TINTA = 0xFF2B2118.toInt()
-private val TINTA_SUAVE = 0x992B2118.toInt()
-private val ROJO = 0xFFB3342A.toInt()
-private val VERDE_ACEL = 0xFF3E6B4A.toInt()
+// Paleta GT3: carbono, grafito, plata y acentos de volante de carreras
+private val CARBON = 0xFF0F1113.toInt()
+private val GRAFITO = 0xFF2B2F35.toInt()
+private val GRAFITO_OSC = 0xFF15181B.toInt()
+private val ALCANTARA = 0xFF3A3F46.toInt()
+private val PLATA = 0xFFC3C8CE.toInt()
+private val PLATA_OSC = 0xFF7D858E.toInt()
+private val BLANCO = 0xFFF2F4F6.toInt()
+private val NARANJA = 0xFFFF7A1A.toInt()
+private val VERDE_GT = 0xFF2BD66A.toInt()
+private val ROJO_GT = 0xFFF0392B.toInt()
+private val AZUL_GT = 0xFF3A8DFF.toInt()
+private val AMARILLO_GT = 0xFFFFC21A.toInt()
+private val APAGADO = 0xFF4A5057.toInt()
 
 /** Ajustes del usuario (se guardan en el celular). */
 object Cfg {
@@ -60,6 +69,7 @@ object Cfg {
     var invert = false
     var dead = 0.04f       // zona muerta del pedal
     var smooth = 0.4f      // respuesta de la dirección
+    var gradual = true     // vibración que crece con el pedal
 }
 
 class MainActivity : Activity(), SensorEventListener {
@@ -73,6 +83,8 @@ class MainActivity : Activity(), SensorEventListener {
     private var hasReading = false
     private var range = 180f
     private var vib: Vibrator? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private var pumping = false
     @Volatile private var searching = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -93,20 +105,20 @@ class MainActivity : Activity(), SensorEventListener {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(VERDE)
+            setBackgroundColor(CARBON)
             setPadding(80, 30, 80, 30)
         }
         val title = TextView(this).apply {
-            text = "Gyromovil"; textSize = 34f; setTextColor(CREMA); gravity = Gravity.CENTER
+            text = "Gyromovil"; textSize = 34f; setTextColor(BLANCO); gravity = Gravity.CENTER
             typeface = serif
         }
         val status = TextView(this).apply {
-            setTextColor(LATON); gravity = Gravity.CENTER; setPadding(0, 10, 0, 10)
+            setTextColor(NARANJA); gravity = Gravity.CENTER; setPadding(0, 10, 0, 10)
         }
         val ip = EditText(this).apply {
             setText(prefs.getString("ip", ""))
             hint = "o escribe la IP (192.168.1.20)"
-            setTextColor(CREMA); setHintTextColor(Color.GRAY); gravity = Gravity.CENTER
+            setTextColor(BLANCO); setHintTextColor(Color.GRAY); gravity = Gravity.CENTER
             setSingleLine()
         }
         val go = Button(this).apply {
@@ -144,6 +156,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
         d.rangeDeg = range
         d.onHaptic = { buzz(it) }
+        d.onPedal = { startPump() }
         d.onSettings = { showSettings() }
         dash = d
         setContentView(d)
@@ -180,9 +193,50 @@ class MainActivity : Activity(), SensorEventListener {
         }.start()
     }
 
+    /** Mientras el pedal está activo, vibra cada vez más fuerte cuanto más lo empujas. */
+    private val pump = object : Runnable {
+        override fun run() {
+            val d = dash
+            val g = d?.gas ?: 0f
+            val br = d?.brake ?: 0f
+            val level = max(g, br)
+            if (d != null && level > 0f && Cfg.haptics && Cfg.gradual) {
+                val braking = br > g
+                gradualBuzz(level, braking)
+                handler.postDelayed(this, if (braking) 100L else 60L)
+            } else {
+                pumping = false
+                vib?.cancel()
+            }
+        }
+    }
+
+    private fun startPump() {
+        if (pumping || !Cfg.haptics || !Cfg.gradual) return
+        pumping = true
+        handler.post(pump)
+    }
+
+    /** Acelerar: zumbido continuo. Frenar: pulsos. Los dos crecen con la fuerza del pedal. */
+    private fun gradualBuzz(level: Float, braking: Boolean) {
+        val v = vib ?: return
+        if (!v.hasVibrator()) return
+        val scale = floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
+        val amp = (30 + 225 * level * scale).toInt().coerceIn(1, 255)
+        val ms = if (braking) 50L else 70L
+        if (Build.VERSION.SDK_INT >= 26) {
+            // sin control de intensidad en el motor, se simula alargando el pulso
+            val dur = if (v.hasAmplitudeControl()) ms else (ms * (0.3f + 0.7f * level)).toLong().coerceAtLeast(10L)
+            v.vibrate(VibrationEffect.createOneShot(dur, amp))
+        } else {
+            @Suppress("DEPRECATION") v.vibrate(ms)
+        }
+    }
+
     private fun loadCfg() {
         val p = getSharedPreferences("gw", MODE_PRIVATE)
         Cfg.haptics = p.getBoolean("hap", true)
+        Cfg.gradual = p.getBoolean("grad", true)
         Cfg.level = p.getInt("lvl", 1)
         Cfg.invert = p.getBoolean("inv", false)
         Cfg.dead = p.getFloat("dead", 0.04f)
@@ -191,7 +245,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun saveCfg() {
         getSharedPreferences("gw", MODE_PRIVATE).edit()
-            .putBoolean("hap", Cfg.haptics).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
+            .putBoolean("hap", Cfg.haptics).putBoolean("grad", Cfg.gradual).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
             .putFloat("dead", Cfg.dead).putFloat("smo", Cfg.smooth).apply()
     }
 
@@ -209,6 +263,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun showSettings() {
         fun label(t: String) = TextView(this).apply { text = t; textSize = 15f; setPadding(0, 24, 0, 6) }
         val hap = Switch(this).apply { text = "Vibración"; isChecked = Cfg.haptics }
+        val grad = Switch(this).apply { text = "Vibración gradual del pedal"; isChecked = Cfg.gradual }
         val lvl = SeekBar(this).apply { max = 2; progress = Cfg.level }
         val inv = Switch(this).apply { text = "Invertir dirección"; isChecked = Cfg.invert }
         val dead = SeekBar(this).apply { max = 15; progress = (Cfg.dead * 100f).roundToInt() }
@@ -217,6 +272,7 @@ class MainActivity : Activity(), SensorEventListener {
             orientation = LinearLayout.VERTICAL
             setPadding(40, 20, 40, 10)
             addView(hap)
+            addView(grad)
             addView(label("Intensidad de la vibración (suave ← → fuerte)")); addView(lvl)
             addView(inv)
             addView(label("Zona muerta del pedal: 0 a 15 %")); addView(dead)
@@ -227,6 +283,7 @@ class MainActivity : Activity(), SensorEventListener {
             .setView(ScrollView(this).apply { addView(box) })
             .setPositiveButton("Guardar") { _, _ ->
                 Cfg.haptics = hap.isChecked
+                Cfg.gradual = grad.isChecked
                 Cfg.level = lvl.progress
                 Cfg.invert = inv.isChecked
                 Cfg.dead = dead.progress / 100f
@@ -300,6 +357,9 @@ class MainActivity : Activity(), SensorEventListener {
     override fun onPause() {
         super.onPause()
         running = false
+        handler.removeCallbacks(pump)
+        pumping = false
+        vib?.cancel()
         sm.unregisterListener(this)
     }
 
@@ -340,210 +400,230 @@ class DashView(ctx: Context) : View(ctx) {
     var onRange: () -> Unit = {}
     var onSettings: () -> Unit = {}
     var onHaptic: (Int) -> Unit = {}
-    private var lastStep = 0
-    private val settingsR = RectF()
+    var onPedal: () -> Unit = {}
 
     val gas: Float get() = deadzone(pedal)
     val brake: Float get() = deadzone(-pedal)
     private fun deadzone(x: Float) = if (x < Cfg.dead) 0f else (x - Cfg.dead) / (1f - Cfg.dead)
 
     private val pedalR = RectF(); private val upR = RectF(); private val downR = RectF()
-    private val calR = RectF(); private val rangeR = RectF(); private val tmp = RectF()
+    private val calR = RectF(); private val rangeR = RectF(); private val settingsR = RectF()
+    private val ledR = RectF(); private val tmp = RectF()
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bgPaint = Paint()
-    private val fontNum = Typeface.create(Typeface.SERIF, Typeface.BOLD)
-    private val fontLabel = Typeface.create(Typeface.SERIF, Typeface.BOLD_ITALIC)
+    private val fontMono = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    private val fontCond = Typeface.create("sans-serif-condensed", Typeface.BOLD)
     private var wx = 0f; private var wy = 0f; private var wr = 0f
     private var trackCy = 0f; private var halfLen = 1f; private var knobH = 60f
     private var pedalId = -1
-    private var gearCaptionY = 0f; private var gearCaptionX = 0f
+    private var lastStep = 0
+    private var gearCaptionX = 0f; private var gearCaptionY = 0f
+
+    init {
+        // Fondo de fibra de carbono: un cuadrito que se repite
+        val t = 20
+        val bmp = Bitmap.createBitmap(t, t, Bitmap.Config.ARGB_8888)
+        val cv = Canvas(bmp)
+        val q = Paint()
+        cv.drawColor(0xFF111316.toInt())
+        q.color = 0xFF1A1D21.toInt()
+        cv.drawRect(0f, 0f, t / 2f, t / 2f, q)
+        cv.drawRect(t / 2f, t / 2f, t.toFloat(), t.toFloat(), q)
+        q.color = 0xFF0C0D0F.toInt()
+        cv.drawRect(t / 2f, 0f, t.toFloat(), t / 2f, q)
+        bgPaint.shader = BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+    }
 
     override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
         val m = 20f
         val sideW = w * 0.2f
-        // Derecha: palanca única acelerador / freno
+        val gap = 14f
+        // Derecha: palanca única
         pedalR.set(w - m - sideW, m, w - m, h - m)
         val hh = pedalR.height()
         knobH = hh * 0.085f
         trackCy = pedalR.centerY()
         halfLen = hh * 0.5f - hh * 0.22f - knobH / 2f
-        // Izquierda: marchas en horizontal
-        val gap = 14f
+        // Izquierda: ajustes, giro y marchas
+        val cbh = h * 0.13f
+        settingsR.set(m, m, m + sideW, m + cbh)
+        rangeR.set(m, m + cbh + gap, m + sideW, m + 2 * cbh + gap)
         val gb = (sideW - gap) / 2f
-        val gy = h / 2f - gb / 2f
+        val gy = h / 2f - gb / 2f + cbh * 0.5f
         downR.set(m, gy, m + gb, gy + gb)
         upR.set(m + gb + gap, gy, m + sideW, gy + gb)
         gearCaptionX = m + sideW / 2f
-        gearCaptionY = gy - 18f
-        // Centro: botones y volante
+        gearCaptionY = gy - 16f
+        // Centro: tira de luces, volante y botón de centrar
+        val cl = m + sideW + gap
+        val cr = pedalR.left - gap
         val cbw = w * 0.2f
-        val cbh = h * 0.13f
-        rangeR.set(w / 2f - cbw / 2f, m, w / 2f + cbw / 2f, m + cbh)
-        settingsR.set(m, m, m + sideW, m + cbh)
-        calR.set(w / 2f - cbw / 2f, h - m - 14f - cbh, w / 2f + cbw / 2f, h - m - 14f)
-        val availH = calR.top - rangeR.bottom
-        wr = min(availH / 2f - 12f, (pedalR.left - (m + sideW)) / 2f - 14f)
-        wx = w / 2f
-        wy = rangeR.bottom + availH / 2f
-        bgPaint.shader = RadialGradient(
-            w / 2f, h / 2f, max(w, h) * 0.7f,
-            0xFF2C4D3E.toInt(), 0xFF142A21.toInt(), Shader.TileMode.CLAMP
-        )
+        ledR.set(cl, m, cr, m + h * 0.07f)
+        calR.set(w / 2f - cbw / 2f, h - m - gap - cbh, w / 2f + cbw / 2f, h - m - gap)
+        val availH = calR.top - ledR.bottom
+        wr = min(availH / 2f - 12f, (cr - cl) / 2f - 6f)
+        wx = (cl + cr) / 2f
+        wy = ledR.bottom + availH / 2f
     }
 
     override fun onDraw(c: Canvas) {
         c.drawPaint(bgPaint)
+        drawLeds(c)
         drawPedalPanel(c)
         drawWheel(c)
 
-        p.typeface = fontLabel
         p.style = Paint.Style.FILL
-        p.color = CREMA
+        p.typeface = fontCond
+        p.color = PLATA_OSC
         p.textAlign = Paint.Align.CENTER
-        p.textSize = 30f
-        c.drawText("Marcha", gearCaptionX, gearCaptionY, p)
-        button(c, downR, "−", down, downR.height() * 0.7f)
-        button(c, upR, "+", up, downR.height() * 0.7f)
-        button(c, calR, "Centrar", false, min(calR.height() * 0.42f, 34f))
-        button(c, rangeR, "Giro ${rangeDeg.roundToInt()}°", false, min(rangeR.height() * 0.42f, 34f))
-        button(c, settingsR, "Ajustes", false, min(settingsR.height() * 0.42f, 34f))
+        p.textSize = 26f
+        c.drawText("MARCHA", gearCaptionX, gearCaptionY, p)
+        button(c, downR, "−", down, downR.height() * 0.7f, AZUL_GT)
+        button(c, upR, "+", up, downR.height() * 0.7f, NARANJA)
+        button(c, calR, "Centrar", false, min(calR.height() * 0.42f, 34f), PLATA_OSC)
+        button(c, rangeR, "Giro ${rangeDeg.roundToInt()}°", false, min(rangeR.height() * 0.42f, 34f), PLATA_OSC)
+        button(c, settingsR, "Ajustes", false, min(settingsR.height() * 0.42f, 34f), PLATA_OSC)
 
-        p.typeface = fontLabel
-        p.style = Paint.Style.FILL
-        p.color = 0xFFB9B08F.toInt()
-        p.textAlign = Paint.Align.CENTER
+        p.typeface = fontMono
+        p.color = APAGADO
         p.textSize = 22f
         c.drawText(status, width / 2f, height - 4f, p)
     }
 
+    /** Tira de luces como la de un volante GT3: se enciende con el acelerador. */
+    private fun drawLeds(c: Canvas) {
+        val n = 15
+        val cw = ledR.width() / n
+        val rad = min(cw, ledR.height()) * 0.36f
+        val lit = ceil(gas * n).toInt()
+        p.style = Paint.Style.FILL
+        for (i in 0 until n) {
+            p.color = if (i < lit) {
+                if (i < 5) VERDE_GT else if (i < 10) ROJO_GT else AZUL_GT
+            } else 0xFF23272C.toInt()
+            c.drawCircle(ledR.left + cw * (i + 0.5f), ledR.centerY(), rad, p)
+        }
+    }
+
     private fun drawWheel(c: Canvas) {
-        val hub = wr * 0.3f
+        val a = wr * 0.8f
+        val b = wr * 0.6f
         c.save()
         c.rotate(steer * 135f, wx, wy)
         p.style = Paint.Style.STROKE
         p.strokeCap = Paint.Cap.ROUND
-        p.strokeWidth = wr * 0.14f
-        p.color = CREMA
-        c.drawCircle(wx, wy, wr, p)
-        c.drawLine(wx - wr, wy, wx - hub, wy, p)
-        c.drawLine(wx + hub, wy, wx + wr, wy, p)
-        c.drawLine(wx, wy + hub, wx, wy + wr, p)
-        p.color = ROJO
-        c.drawLine(wx, wy - wr - wr * 0.1f, wx, wy - wr + wr * 0.1f, p)
+        // aro rectangular
+        p.strokeWidth = wr * 0.12f
+        p.color = GRAFITO
+        tmp.set(wx - a, wy - b, wx + a, wy + b)
+        c.drawRoundRect(tmp, b * 0.75f, b * 0.75f, p)
+        // empuñaduras de alcántara
+        p.strokeWidth = wr * 0.2f
+        p.color = ALCANTARA
+        c.drawLine(wx - a, wy - b * 0.45f, wx - a, wy + b * 0.45f, p)
+        c.drawLine(wx + a, wy - b * 0.45f, wx + a, wy + b * 0.45f, p)
+        // barra central
+        p.strokeWidth = wr * 0.09f
+        p.color = PLATA_OSC
+        c.drawLine(wx - a, wy, wx + a, wy, p)
+        // marca de las 12 en punto
+        p.strokeCap = Paint.Cap.BUTT
+        p.strokeWidth = wr * 0.07f
+        p.color = NARANJA
+        c.drawLine(wx, wy - b - wr * 0.09f, wx, wy - b + wr * 0.09f, p)
+        // botones de colores
         p.style = Paint.Style.FILL
-        p.color = VERDE_OSCURO
+        for ((dx, col) in listOf(-0.6f to ROJO_GT, -0.38f to AMARILLO_GT, 0.38f to AZUL_GT, 0.6f to VERDE_GT)) {
+            p.color = col
+            c.drawCircle(wx + dx * a, wy - wr * 0.2f, wr * 0.055f, p)
+        }
+        // centro
+        val hub = wr * 0.3f
+        p.color = 0xFF050607.toInt()
         c.drawCircle(wx, wy, hub, p)
         p.style = Paint.Style.STROKE
         p.strokeWidth = 5f
-        p.color = LATON
+        p.color = NARANJA
         c.drawCircle(wx, wy, hub, p)
         c.restore()
 
         p.style = Paint.Style.FILL
-        p.typeface = fontNum
-        p.color = CREMA
+        p.typeface = fontMono
+        p.color = NARANJA
         p.textAlign = Paint.Align.CENTER
-        p.textSize = wr * 0.26f
+        p.textSize = wr * 0.24f
         c.drawText("${(steer * rangeDeg / 2f).roundToInt()}°", wx, wy + p.textSize / 3f, p)
     }
 
     private fun drawPedalPanel(c: Canvas) {
         val r = pedalR
         val pw = r.width()
-        val hh = r.height()
         val cx = r.centerX()
-
-        // Bisel de latón y placa crema
         p.style = Paint.Style.FILL
-        p.color = LATON_OSCURO
-        c.drawRoundRect(r, 28f, 28f, p)
-        tmp.set(r.left + 6f, r.top + 6f, r.right - 6f, r.bottom - 6f)
-        p.color = LATON
-        c.drawRoundRect(tmp, 24f, 24f, p)
-        tmp.set(r.left + 16f, r.top + 16f, r.right - 16f, r.bottom - 16f)
-        p.color = CREMA
-        c.drawRoundRect(tmp, 16f, 16f, p)
+        p.color = 0xFF0A0B0D.toInt()
+        c.drawRoundRect(r, 22f, 22f, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        p.color = PLATA_OSC
+        c.drawRoundRect(r, 22f, 22f, p)
 
-        // Porcentajes
         val gasV = gas
         val brakeV = brake
-        val labelSize = pw * 0.072f
-        val pctSize = pw * 0.17f
-        p.textAlign = Paint.Align.CENTER
-
-        p.typeface = fontLabel; p.textSize = labelSize; p.color = TINTA
-        c.drawText("Acelerador", cx, r.top + 16f + labelSize + 12f, p)
-        p.typeface = fontNum; p.textSize = pctSize
-        p.color = if (gasV > 0f) VERDE_ACEL else TINTA_SUAVE
-        c.drawText("${(gasV * 100).roundToInt()}%", cx, r.top + 16f + labelSize + 12f + pctSize + 8f, p)
-
-        p.typeface = fontLabel; p.textSize = labelSize; p.color = TINTA
-        c.drawText("Freno", cx, r.bottom - 16f - 12f, p)
-        p.typeface = fontNum; p.textSize = pctSize
-        p.color = if (brakeV > 0f) ROJO else TINTA_SUAVE
-        c.drawText("${(brakeV * 100).roundToInt()}%", cx, r.bottom - 16f - 12f - labelSize - 10f, p)
-
-        // Ranura con relleno desde el centro
-        val trackTop = r.top + hh * 0.22f
-        val trackBot = r.bottom - hh * 0.22f
-        val gh = pw * 0.07f
+        val tag = pw * 0.075f
+        val pct = pw * 0.17f
         p.style = Paint.Style.FILL
-        p.color = TINTA
-        tmp.set(cx - gh, trackTop, cx + gh, trackBot)
-        c.drawRoundRect(tmp, gh, gh, p)
-        val ky = trackCy - pedal * halfLen
-        if (pedal > 0f) {
-            p.color = VERDE_ACEL
-            tmp.set(cx - gh, ky, cx + gh, trackCy)
-            c.drawRect(tmp, p)
-        } else if (pedal < 0f) {
-            p.color = ROJO
-            tmp.set(cx - gh, trackCy, cx + gh, ky)
-            c.drawRect(tmp, p)
+        p.textAlign = Paint.Align.CENTER
+        p.typeface = fontCond; p.textSize = tag; p.color = PLATA
+        c.drawText("ACEL", cx, r.top + 16f + tag + 8f, p)
+        p.typeface = fontMono; p.textSize = pct
+        p.color = if (gasV > 0f) VERDE_GT else APAGADO
+        c.drawText("${(gasV * 100).roundToInt()}%", cx, r.top + 16f + tag + 8f + pct + 8f, p)
+        p.color = if (brakeV > 0f) ROJO_GT else APAGADO
+        c.drawText("${(brakeV * 100).roundToInt()}%", cx, r.bottom - 16f - tag - 22f, p)
+        p.typeface = fontCond; p.textSize = tag; p.color = PLATA
+        c.drawText("FRENO", cx, r.bottom - 16f, p)
+
+        // barras por segmentos: verde sube, rojo baja
+        val n = 10
+        val step = halfLen / n
+        val gap = 5f
+        val bw = pw * 0.34f
+        for (i in 0 until n) {
+            tmp.set(cx - bw / 2f, trackCy - (i + 1) * step + gap / 2f, cx + bw / 2f, trackCy - i * step - gap / 2f)
+            p.color = if (gasV * n > i) VERDE_GT else 0xFF1B1F23.toInt()
+            c.drawRoundRect(tmp, 6f, 6f, p)
+            tmp.set(cx - bw / 2f, trackCy + i * step + gap / 2f, cx + bw / 2f, trackCy + (i + 1) * step - gap / 2f)
+            p.color = if (brakeV * n > i) ROJO_GT else 0xFF1B1F23.toInt()
+            c.drawRoundRect(tmp, 6f, 6f, p)
         }
 
-        // Marcas de la escala (cada 10 %)
+        // perilla de aluminio
+        val ky = trackCy - pedal * halfLen
+        val kw = pw * 0.8f
+        tmp.set(cx - kw / 2f, ky - knobH / 2f, cx + kw / 2f, ky + knobH / 2f)
+        p.color = PLATA_OSC
+        c.drawRoundRect(tmp, 12f, 12f, p)
+        tmp.set(tmp.left + 4f, tmp.top + 4f, tmp.right - 4f, tmp.bottom - 4f)
+        p.color = PLATA
+        c.drawRoundRect(tmp, 9f, 9f, p)
         p.style = Paint.Style.STROKE
         p.strokeCap = Paint.Cap.BUTT
-        p.color = TINTA
-        for (i in -10..10) {
-            val y = trackCy - i / 10f * halfLen
-            val big = i % 5 == 0
-            val len = if (big) pw * 0.2f else pw * 0.1f
-            p.strokeWidth = if (i == 0) 6f else if (big) 4f else 2f
-            c.drawLine(cx - gh - 6f - len, y, cx - gh - 6f, y, p)
-            c.drawLine(cx + gh + 6f, y, cx + gh + 6f + len, y, p)
-        }
-
-        // Perilla de latón
-        val kw = pw * 0.68f
-        p.style = Paint.Style.FILL
-        tmp.set(cx - kw / 2f, ky - knobH / 2f, cx + kw / 2f, ky + knobH / 2f)
-        p.color = LATON_OSCURO
-        c.drawRoundRect(tmp, 14f, 14f, p)
-        tmp.set(tmp.left + 4f, tmp.top + 4f, tmp.right - 4f, tmp.bottom - 4f)
-        p.color = LATON
-        c.drawRoundRect(tmp, 11f, 11f, p)
-        p.style = Paint.Style.STROKE
-        p.color = TINTA
-        p.strokeWidth = 4f
+        p.strokeWidth = 5f
+        p.color = NARANJA
         c.drawLine(cx - kw / 2f + 14f, ky, cx + kw / 2f - 14f, ky, p)
-        p.strokeWidth = 2f
-        c.drawLine(cx - kw / 2f + 14f, ky - knobH * 0.25f, cx + kw / 2f - 14f, ky - knobH * 0.25f, p)
-        c.drawLine(cx - kw / 2f + 14f, ky + knobH * 0.25f, cx + kw / 2f - 14f, ky + knobH * 0.25f, p)
     }
 
-    private fun button(c: Canvas, r: RectF, label: String, pressed: Boolean, textSize: Float) {
+    private fun button(c: Canvas, r: RectF, label: String, pressed: Boolean, textSize: Float, accent: Int) {
         p.style = Paint.Style.FILL
-        p.color = if (pressed) LATON_OSCURO else VERDE_OSCURO
-        c.drawRoundRect(r, 18f, 18f, p)
+        p.color = if (pressed) accent else GRAFITO_OSC
+        c.drawRoundRect(r, 14f, 14f, p)
         p.style = Paint.Style.STROKE
         p.strokeWidth = 4f
-        p.color = LATON
-        c.drawRoundRect(r, 18f, 18f, p)
+        p.color = accent
+        c.drawRoundRect(r, 14f, 14f, p)
         p.style = Paint.Style.FILL
-        p.typeface = fontNum
-        p.color = CREMA
+        p.typeface = fontCond
+        p.color = if (pressed) CARBON else BLANCO
         p.textAlign = Paint.Align.CENTER
         p.textSize = textSize
         c.drawText(label, r.centerX(), r.centerY() + textSize / 3f, p)
@@ -581,12 +661,13 @@ class DashView(ctx: Context) : View(ctx) {
                 d = true
             }
         }
-        if (u && !up) onHaptic(1)          // vibración al cambiar de marcha
+        if (u && !up) onHaptic(1)          // clic al cambiar de marcha
         if (d && !down) onHaptic(1)
-        val step = (v * 10f).toInt()       // marca cada 10 % del pedal
-        if (pedalId != -1 && step != lastStep) onHaptic(if (abs(step) >= 10) 2 else 0)
+        val step = (v * 10f).toInt()
+        if (pedalId != -1 && step != lastStep && abs(step) >= 10) onHaptic(2)   // golpe al llegar al tope
         lastStep = step
         pedal = v; up = u; down = d   // al soltar, la palanca vuelve al centro
+        if (pedalId != -1 && v != 0f) onPedal()
         invalidate()
         return true
     }
