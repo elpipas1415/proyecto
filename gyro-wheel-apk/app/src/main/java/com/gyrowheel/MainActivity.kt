@@ -6,7 +6,10 @@ import android.content.pm.ActivityInfo
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RadialGradient
 import android.graphics.RectF
+import android.graphics.Shader
+import android.graphics.Typeface
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -26,8 +29,20 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.Locale
 import kotlin.math.atan2
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+
+// Paleta vintage: verde carreras, crema, latón
+private val VERDE = 0xFF1F3B30.toInt()
+private val VERDE_OSCURO = 0xFF162B22.toInt()
+private val CREMA = 0xFFEADFC0.toInt()
+private val LATON = 0xFFB8923A.toInt()
+private val LATON_OSCURO = 0xFF7A5F22.toInt()
+private val TINTA = 0xFF2B2118.toInt()
+private val TINTA_SUAVE = 0x992B2118.toInt()
+private val ROJO = 0xFFB3342A.toInt()
+private val VERDE_ACEL = 0xFF3E6B4A.toInt()
 
 class MainActivity : Activity(), SensorEventListener {
     private lateinit var sm: SensorManager
@@ -42,7 +57,8 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        // Orientación bloqueada en horizontal (no gira al mover el celular)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         showConnect()
@@ -50,23 +66,25 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun showConnect() {
         val prefs = getSharedPreferences("gw", MODE_PRIVATE)
+        val serif = Typeface.create(Typeface.SERIF, Typeface.BOLD)
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(Color.parseColor("#20262E"))
+            setBackgroundColor(VERDE)
             setPadding(80, 30, 80, 30)
         }
         val title = TextView(this).apply {
-            text = "Gyro Wheel"; textSize = 32f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+            text = "Gyro Wheel"; textSize = 34f; setTextColor(CREMA); gravity = Gravity.CENTER
+            typeface = serif
         }
         val info = TextView(this).apply {
             text = "Escribe la IP que muestra el programa del PC"
-            setTextColor(Color.LTGRAY); gravity = Gravity.CENTER
+            setTextColor(CREMA); gravity = Gravity.CENTER
         }
         val ip = EditText(this).apply {
             setText(prefs.getString("ip", ""))
             hint = "192.168.1.20"
-            setTextColor(Color.WHITE); setHintTextColor(Color.GRAY); gravity = Gravity.CENTER
+            setTextColor(CREMA); setHintTextColor(Color.GRAY); gravity = Gravity.CENTER
             setSingleLine()
         }
         val go = Button(this).apply {
@@ -164,8 +182,8 @@ class MainActivity : Activity(), SensorEventListener {
 
 class DashView(ctx: Context) : View(ctx) {
     @Volatile var steer = 0f
-    @Volatile var gas = 0f
-    @Volatile var brake = 0f
+    /** Palanca única: -1 (freno a fondo) ... 0 (reposo) ... +1 (acelerador a fondo) */
+    @Volatile var pedal = 0f
     @Volatile var up = false
     @Volatile var down = false
     @Volatile var rangeDeg = 180f
@@ -173,120 +191,242 @@ class DashView(ctx: Context) : View(ctx) {
     var onCenter: () -> Unit = {}
     var onRange: () -> Unit = {}
 
-    private val brakeR = RectF(); private val gasR = RectF()
-    private val upR = RectF(); private val downR = RectF()
-    private val calR = RectF(); private val rangeR = RectF()
+    val gas: Float get() = deadzone(pedal)
+    val brake: Float get() = deadzone(-pedal)
+    private fun deadzone(x: Float) = if (x < 0.04f) 0f else (x - 0.04f) / 0.96f
+
+    private val pedalR = RectF(); private val upR = RectF(); private val downR = RectF()
+    private val calR = RectF(); private val rangeR = RectF(); private val tmp = RectF()
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val bgPaint = Paint()
+    private val fontNum = Typeface.create(Typeface.SERIF, Typeface.BOLD)
+    private val fontLabel = Typeface.create(Typeface.SERIF, Typeface.BOLD_ITALIC)
     private var wx = 0f; private var wy = 0f; private var wr = 0f
+    private var trackCy = 0f; private var halfLen = 1f; private var knobH = 60f
+    private var pedalId = -1
+    private var gearCaptionY = 0f; private var gearCaptionX = 0f
 
     override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
         val m = 20f
-        val pw = w * 0.2f
-        brakeR.set(m, m, m + pw, h - m)
-        gasR.set(w - m - pw, m, w - m, h - m)
+        val sideW = w * 0.2f
+        // Derecha: palanca única acelerador / freno
+        pedalR.set(w - m - sideW, m, w - m, h - m)
+        val hh = pedalR.height()
+        knobH = hh * 0.085f
+        trackCy = pedalR.centerY()
+        halfLen = hh * 0.5f - hh * 0.22f - knobH / 2f
+        // Izquierda: marchas en horizontal
         val gap = 14f
-        val bw = (w * 0.6f - 2 * m - 2 * gap) / 3f
-        val bh = h * 0.16f
-        val by = h - m - bh - 14f
-        val x0 = w / 2f - (3 * bw + 2 * gap) / 2f
-        downR.set(x0, by, x0 + bw, by + bh)
-        calR.set(x0 + bw + gap, by, x0 + 2 * bw + gap, by + bh)
-        upR.set(x0 + 2 * (bw + gap), by, x0 + 3 * bw + 2 * gap, by + bh)
-        rangeR.set(w / 2f - bw * 0.9f, m, w / 2f + bw * 0.9f, m + bh * 0.8f)
-        val availH = by - rangeR.bottom
-        wr = min(availH / 2f - 12f, w * 0.28f)
+        val gb = (sideW - gap) / 2f
+        val gy = h / 2f - gb / 2f
+        downR.set(m, gy, m + gb, gy + gb)
+        upR.set(m + gb + gap, gy, m + sideW, gy + gb)
+        gearCaptionX = m + sideW / 2f
+        gearCaptionY = gy - 18f
+        // Centro: botones y volante
+        val cbw = w * 0.2f
+        val cbh = h * 0.13f
+        rangeR.set(w / 2f - cbw / 2f, m, w / 2f + cbw / 2f, m + cbh)
+        calR.set(w / 2f - cbw / 2f, h - m - 14f - cbh, w / 2f + cbw / 2f, h - m - 14f)
+        val availH = calR.top - rangeR.bottom
+        wr = min(availH / 2f - 12f, (pedalR.left - (m + sideW)) / 2f - 14f)
         wx = w / 2f
         wy = rangeR.bottom + availH / 2f
+        bgPaint.shader = RadialGradient(
+            w / 2f, h / 2f, max(w, h) * 0.7f,
+            0xFF2C4D3E.toInt(), 0xFF142A21.toInt(), Shader.TileMode.CLAMP
+        )
     }
 
     override fun onDraw(c: Canvas) {
-        c.drawColor(0xFF20262E.toInt())
-        pedal(c, brakeR, brake, 0xFFD93A35.toInt(), "Freno")
-        pedal(c, gasR, gas, 0xFF2FAE66.toInt(), "Acelerador")
+        c.drawPaint(bgPaint)
+        drawPedalPanel(c)
+        drawWheel(c)
 
+        p.typeface = fontLabel
+        p.style = Paint.Style.FILL
+        p.color = CREMA
+        p.textAlign = Paint.Align.CENTER
+        p.textSize = 30f
+        c.drawText("Marcha", gearCaptionX, gearCaptionY, p)
+        button(c, downR, "−", down, downR.height() * 0.7f)
+        button(c, upR, "+", up, downR.height() * 0.7f)
+        button(c, calR, "Centrar", false, min(calR.height() * 0.42f, 34f))
+        button(c, rangeR, "Giro ${rangeDeg.roundToInt()}°", false, min(rangeR.height() * 0.42f, 34f))
+
+        p.typeface = fontLabel
+        p.style = Paint.Style.FILL
+        p.color = 0xFFB9B08F.toInt()
+        p.textAlign = Paint.Align.CENTER
+        p.textSize = 22f
+        c.drawText(status, width / 2f, height - 4f, p)
+    }
+
+    private fun drawWheel(c: Canvas) {
         val hub = wr * 0.3f
         c.save()
         c.rotate(steer * 135f, wx, wy)
         p.style = Paint.Style.STROKE
         p.strokeCap = Paint.Cap.ROUND
         p.strokeWidth = wr * 0.14f
-        p.color = 0xFFEEF1F4.toInt()
+        p.color = CREMA
         c.drawCircle(wx, wy, wr, p)
         c.drawLine(wx - wr, wy, wx - hub, wy, p)
         c.drawLine(wx + hub, wy, wx + wr, wy, p)
         c.drawLine(wx, wy + hub, wx, wy + wr, p)
-        p.color = 0xFFD93A35.toInt()
+        p.color = ROJO
         c.drawLine(wx, wy - wr - wr * 0.1f, wx, wy - wr + wr * 0.1f, p)
         p.style = Paint.Style.FILL
-        p.color = 0xFF2C343E.toInt()
+        p.color = VERDE_OSCURO
+        c.drawCircle(wx, wy, hub, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 5f
+        p.color = LATON
         c.drawCircle(wx, wy, hub, p)
         c.restore()
 
-        p.color = Color.WHITE
+        p.style = Paint.Style.FILL
+        p.typeface = fontNum
+        p.color = CREMA
         p.textAlign = Paint.Align.CENTER
-        p.textSize = wr * 0.28f
+        p.textSize = wr * 0.26f
         c.drawText("${(steer * rangeDeg / 2f).roundToInt()}°", wx, wy + p.textSize / 3f, p)
-
-        button(c, downR, "Marcha −", down)
-        button(c, calR, "Centrar", false)
-        button(c, upR, "Marcha +", up)
-        button(c, rangeR, "Giro ${rangeDeg.roundToInt()}°", false)
-
-        p.color = 0xFF9AA5B1.toInt()
-        p.textSize = 22f
-        c.drawText(status, width / 2f, height - 4f, p)
     }
 
-    private fun pedal(c: Canvas, r: RectF, v: Float, color: Int, label: String) {
+    private fun drawPedalPanel(c: Canvas) {
+        val r = pedalR
+        val pw = r.width()
+        val hh = r.height()
+        val cx = r.centerX()
+
+        // Bisel de latón y placa crema
         p.style = Paint.Style.FILL
-        p.color = 0xFF2C343E.toInt()
-        c.drawRect(r, p)
-        p.color = color
-        c.drawRect(r.left, r.bottom - r.height() * v, r.right, r.bottom, p)
-        p.style = Paint.Style.STROKE; p.strokeWidth = 3f; p.color = 0xFF4A5562.toInt()
-        c.drawRect(r, p)
-        p.style = Paint.Style.FILL
-        p.color = Color.WHITE
+        p.color = LATON_OSCURO
+        c.drawRoundRect(r, 28f, 28f, p)
+        tmp.set(r.left + 6f, r.top + 6f, r.right - 6f, r.bottom - 6f)
+        p.color = LATON
+        c.drawRoundRect(tmp, 24f, 24f, p)
+        tmp.set(r.left + 16f, r.top + 16f, r.right - 16f, r.bottom - 16f)
+        p.color = CREMA
+        c.drawRoundRect(tmp, 16f, 16f, p)
+
+        // Porcentajes
+        val gasV = gas
+        val brakeV = brake
+        val labelSize = pw * 0.072f
+        val pctSize = pw * 0.17f
         p.textAlign = Paint.Align.CENTER
-        p.textSize = 34f
-        c.drawText(label, r.centerX(), r.top + 44f, p)
-        p.textSize = 44f
-        c.drawText("${(v * 100).roundToInt()}%", r.centerX(), r.bottom - 22f, p)
+
+        p.typeface = fontLabel; p.textSize = labelSize; p.color = TINTA
+        c.drawText("Acelerador", cx, r.top + 16f + labelSize + 12f, p)
+        p.typeface = fontNum; p.textSize = pctSize
+        p.color = if (gasV > 0f) VERDE_ACEL else TINTA_SUAVE
+        c.drawText("${(gasV * 100).roundToInt()}%", cx, r.top + 16f + labelSize + 12f + pctSize + 8f, p)
+
+        p.typeface = fontLabel; p.textSize = labelSize; p.color = TINTA
+        c.drawText("Freno", cx, r.bottom - 16f - 12f, p)
+        p.typeface = fontNum; p.textSize = pctSize
+        p.color = if (brakeV > 0f) ROJO else TINTA_SUAVE
+        c.drawText("${(brakeV * 100).roundToInt()}%", cx, r.bottom - 16f - 12f - labelSize - 10f, p)
+
+        // Ranura con relleno desde el centro
+        val trackTop = r.top + hh * 0.22f
+        val trackBot = r.bottom - hh * 0.22f
+        val gh = pw * 0.07f
+        p.style = Paint.Style.FILL
+        p.color = TINTA
+        tmp.set(cx - gh, trackTop, cx + gh, trackBot)
+        c.drawRoundRect(tmp, gh, gh, p)
+        val ky = trackCy - pedal * halfLen
+        if (pedal > 0f) {
+            p.color = VERDE_ACEL
+            tmp.set(cx - gh, ky, cx + gh, trackCy)
+            c.drawRect(tmp, p)
+        } else if (pedal < 0f) {
+            p.color = ROJO
+            tmp.set(cx - gh, trackCy, cx + gh, ky)
+            c.drawRect(tmp, p)
+        }
+
+        // Marcas de la escala (cada 10 %)
+        p.style = Paint.Style.STROKE
+        p.strokeCap = Paint.Cap.BUTT
+        p.color = TINTA
+        for (i in -10..10) {
+            val y = trackCy - i / 10f * halfLen
+            val big = i % 5 == 0
+            val len = if (big) pw * 0.2f else pw * 0.1f
+            p.strokeWidth = if (i == 0) 6f else if (big) 4f else 2f
+            c.drawLine(cx - gh - 6f - len, y, cx - gh - 6f, y, p)
+            c.drawLine(cx + gh + 6f, y, cx + gh + 6f + len, y, p)
+        }
+
+        // Perilla de latón
+        val kw = pw * 0.68f
+        p.style = Paint.Style.FILL
+        tmp.set(cx - kw / 2f, ky - knobH / 2f, cx + kw / 2f, ky + knobH / 2f)
+        p.color = LATON_OSCURO
+        c.drawRoundRect(tmp, 14f, 14f, p)
+        tmp.set(tmp.left + 4f, tmp.top + 4f, tmp.right - 4f, tmp.bottom - 4f)
+        p.color = LATON
+        c.drawRoundRect(tmp, 11f, 11f, p)
+        p.style = Paint.Style.STROKE
+        p.color = TINTA
+        p.strokeWidth = 4f
+        c.drawLine(cx - kw / 2f + 14f, ky, cx + kw / 2f - 14f, ky, p)
+        p.strokeWidth = 2f
+        c.drawLine(cx - kw / 2f + 14f, ky - knobH * 0.25f, cx + kw / 2f - 14f, ky - knobH * 0.25f, p)
+        c.drawLine(cx - kw / 2f + 14f, ky + knobH * 0.25f, cx + kw / 2f - 14f, ky + knobH * 0.25f, p)
     }
 
-    private fun button(c: Canvas, r: RectF, label: String, pressed: Boolean) {
+    private fun button(c: Canvas, r: RectF, label: String, pressed: Boolean, textSize: Float) {
         p.style = Paint.Style.FILL
-        p.color = if (pressed) 0xFF4A5562.toInt() else 0xFF2C343E.toInt()
+        p.color = if (pressed) LATON_OSCURO else VERDE_OSCURO
         c.drawRoundRect(r, 18f, 18f, p)
-        p.style = Paint.Style.STROKE; p.strokeWidth = 3f; p.color = 0xFF4A5562.toInt()
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        p.color = LATON
         c.drawRoundRect(r, 18f, 18f, p)
         p.style = Paint.Style.FILL
-        p.color = Color.WHITE
+        p.typeface = fontNum
+        p.color = CREMA
         p.textAlign = Paint.Align.CENTER
-        p.textSize = min(r.height() * 0.42f, 34f)
-        c.drawText(label, r.centerX(), r.centerY() + p.textSize / 3f, p)
+        p.textSize = textSize
+        c.drawText(label, r.centerX(), r.centerY() + textSize / 3f, p)
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
-        var b = 0f; var g = 0f; var u = false; var d = false
         val act = e.actionMasked
+        if (act == MotionEvent.ACTION_CANCEL) {
+            pedalId = -1; pedal = 0f; up = false; down = false
+            invalidate()
+            return true
+        }
         val lifting = if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_POINTER_UP) e.actionIndex else -1
-        if (act != MotionEvent.ACTION_CANCEL) {
-            for (i in 0 until e.pointerCount) {
-                if (i == lifting) continue
-                val x = e.getX(i); val y = e.getY(i)
-                val fresh = (act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_POINTER_DOWN) && i == e.actionIndex
-                when {
-                    brakeR.contains(x, y) -> b = ((brakeR.bottom - y) / brakeR.height()).coerceIn(0f, 1f)
-                    gasR.contains(x, y) -> g = ((gasR.bottom - y) / gasR.height()).coerceIn(0f, 1f)
-                    upR.contains(x, y) -> u = true
-                    downR.contains(x, y) -> d = true
-                    calR.contains(x, y) -> if (fresh) onCenter()
-                    rangeR.contains(x, y) -> if (fresh) onRange()
-                }
+        if (act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_POINTER_DOWN) {
+            val i = e.actionIndex
+            val x = e.getX(i); val y = e.getY(i)
+            when {
+                pedalR.contains(x, y) -> pedalId = e.getPointerId(i)
+                calR.contains(x, y) -> onCenter()
+                rangeR.contains(x, y) -> onRange()
             }
         }
-        brake = b; gas = g; up = u; down = d
+        if (lifting >= 0 && e.getPointerId(lifting) == pedalId) pedalId = -1
+
+        var v = 0f; var u = false; var d = false
+        for (i in 0 until e.pointerCount) {
+            if (i == lifting) continue
+            val x = e.getX(i); val y = e.getY(i)
+            if (e.getPointerId(i) == pedalId) {
+                v = ((trackCy - y) / halfLen).coerceIn(-1f, 1f)   // arriba acelera, abajo frena
+            } else if (upR.contains(x, y)) {
+                u = true
+            } else if (downR.contains(x, y)) {
+                d = true
+            }
+        }
+        pedal = v; up = u; down = d   // al soltar, la palanca vuelve al centro
         invalidate()
         return true
     }
