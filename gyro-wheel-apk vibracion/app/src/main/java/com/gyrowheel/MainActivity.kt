@@ -77,6 +77,9 @@ object Cfg {
     var smooth = 0.4f      // respuesta de la dirección
     var drift = false      // modo drift: freno de mano y embrague
     var telemetry = true   // usar marcha y revoluciones del juego
+    var bumpGain = 100     // fuerza de la vibración por baches (% )
+    var gripGain = 100     // fuerza de la vibración por límite de agarre (%)
+    var clutchInvert = false
 }
 
 class MainActivity : Activity(), SensorEventListener {
@@ -180,6 +183,8 @@ class MainActivity : Activity(), SensorEventListener {
         if (s == null) { d.status = "Este celular no tiene sensor de movimiento"; return }
         sm.registerListener(this, s, SensorManager.SENSOR_DELAY_GAME)
         running = true
+        handler.removeCallbacks(ffbPump)
+        handler.post(ffbPump)
         Thread {
             try {
                 val sock = DatagramSocket()
@@ -192,7 +197,7 @@ class MainActivity : Activity(), SensorEventListener {
                         Locale.US, "%.4f,%.3f,%.3f,%d,%d,%d,%d",
                         if (inSettings) 0f else d.steer, if (inSettings) 0f else d.gas, if (inSettings) 0f else d.brake,
                         if (!inSettings && d.up) 1 else 0, if (!inSettings && d.down) 1 else 0,
-                        if (!inSettings && d.handbrake) 1 else 0, if (!inSettings && d.clutch) 1 else 0
+                        if (!inSettings && d.handbrake) 1 else 0, if ((!inSettings && d.clutch) != Cfg.clutchInvert) 1 else 0
                     )
                     val b = msg.toByteArray()
                     sock.send(DatagramPacket(b, b.size, ipAddr, 5005))
@@ -253,6 +258,9 @@ class MainActivity : Activity(), SensorEventListener {
         Cfg.gearHaptic = p.getBoolean("gearhap", true)
         Cfg.drift = p.getBoolean("drift", false)
         Cfg.telemetry = p.getBoolean("tele", true)
+        Cfg.bumpGain = p.getInt("bump", 100)
+        Cfg.gripGain = p.getInt("grip", 100)
+        Cfg.clutchInvert = p.getBoolean("cinv", false)
         range = p.getFloat("range", 180f)
         Cfg.level = p.getInt("lvl", 1)
         Cfg.invert = p.getBoolean("inv", false)
@@ -262,8 +270,24 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun saveCfg() {
         getSharedPreferences("gw", MODE_PRIVATE).edit()
-            .putInt("mode", Cfg.hapMode).putBoolean("gearhap", Cfg.gearHaptic).putBoolean("drift", Cfg.drift).putBoolean("tele", Cfg.telemetry).putFloat("range", range).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
+            .putInt("mode", Cfg.hapMode).putBoolean("gearhap", Cfg.gearHaptic).putBoolean("drift", Cfg.drift).putBoolean("tele", Cfg.telemetry).putInt("bump", Cfg.bumpGain).putInt("grip", Cfg.gripGain).putBoolean("cinv", Cfg.clutchInvert).putFloat("range", range).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
             .putFloat("dead", Cfg.dead).putFloat("smo", Cfg.smooth).apply()
+    }
+
+    /** Modo FFB: vibra según los baches y el límite de agarre que informa el juego. */
+    private val ffbPump = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val d = dash
+            if (d != null && !inSettings && Cfg.hapMode == 3 && d.telemetryOn && SystemClock.uptimeMillis() >= holdUntil) {
+                val b = min(1f, d.tBump / 100f * (Cfg.bumpGain / 100f))
+                val g = min(1f, d.tGrip / 100f * (Cfg.gripGain / 100f))
+                val k = floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
+                if (b >= 0.1f) pulse(35, (40 + 215 * b * k).toInt())
+                else if (g >= 0.1f) pulse(70, (30 + 170 * g * k).toInt())
+            }
+            handler.postDelayed(this, 40)
+        }
     }
 
     /** Recibe del PC la marcha y las revoluciones del juego ("T,marcha,rpm,rpmMax,km/h"). */
@@ -280,6 +304,14 @@ class MainActivity : Activity(), SensorEventListener {
                         d.tRpm = parts[2].trim().toInt()
                         d.tMaxRpm = parts[3].trim().toInt()
                         d.tSpeed = parts[4].trim().toFloat()
+                        if (parts.size >= 11) {
+                            d.tCur = parts[5].trim().toInt()
+                            d.tLast = parts[6].trim().toInt()
+                            d.tBest = parts[7].trim().toInt()
+                            d.tDelta = if (parts[8].trim() == "N") Int.MIN_VALUE else parts[8].trim().toInt()
+                            d.tBump = parts[9].trim().toInt()
+                            d.tGrip = parts[10].trim().toInt()
+                        }
                         d.tStamp = SystemClock.uptimeMillis()
                     }
                 } catch (e: java.net.SocketTimeoutException) {
@@ -378,9 +410,11 @@ class MainActivity : Activity(), SensorEventListener {
             0 -> add(
                 hdr("Vibración"),
                 txt("Modo"),
-                radios(listOf("Normal: sigue la fuerza de los pedales", "Simple: solo marcha y cambio de acelerador a freno", "Sin vibración"), Cfg.hapMode) { Cfg.hapMode = it },
+                radios(listOf("Normal: sigue la fuerza de los pedales", "Simple: solo marcha y cambio de acelerador a freno", "Sin vibración", "FFB del juego: baches, curbs y límite de agarre"), Cfg.hapMode) { Cfg.hapMode = it },
                 toggleRow("Vibrar al cambiar de marcha", Cfg.gearHaptic) { Cfg.gearHaptic = it },
                 slider("Intensidad", 0, 2, Cfg.level, { listOf("Suave", "Media", "Fuerte")[it] }) { Cfg.level = it },
+                slider("Baches y curbs (modo FFB)", 0, 200, Cfg.bumpGain, { "$it %" }) { Cfg.bumpGain = it },
+                slider("Límite de agarre (modo FFB)", 0, 200, Cfg.gripGain, { "$it %" }) { Cfg.gripGain = it },
                 action("Probar vibración") { testBuzz() }
             )
             1 -> add(
@@ -396,7 +430,8 @@ class MainActivity : Activity(), SensorEventListener {
             )
             3 -> add(
                 hdr("Modo de juego"),
-                radios(listOf("Carrera: marchas y pedales", "Drift: agrega freno de mano y embrague"), if (Cfg.drift) 1 else 0) { Cfg.drift = it == 1 }
+                radios(listOf("Carrera: marchas y pedales", "Drift: agrega freno de mano y embrague"), if (Cfg.drift) 1 else 0) { Cfg.drift = it == 1 },
+                toggleRow("Invertir embrague (si en el juego va al revés)", Cfg.clutchInvert) { Cfg.clutchInvert = it }
             )
             else -> add(
                 hdr("Conexión"),
@@ -453,6 +488,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun resetCfg() {
         Cfg.hapMode = 0; Cfg.gearHaptic = true; Cfg.level = 1; Cfg.invert = false
         Cfg.dead = 0.04f; Cfg.smooth = 0.4f; Cfg.drift = false; Cfg.telemetry = true
+        Cfg.bumpGain = 100; Cfg.gripGain = 100; Cfg.clutchInvert = false
         range = 180f
         dash?.rangeDeg = range
         saveCfg()
@@ -520,6 +556,7 @@ class MainActivity : Activity(), SensorEventListener {
         super.onPause()
         running = false
         handler.removeCallbacks(pump)
+        handler.removeCallbacks(ffbPump)
         pumping = false
         vib?.cancel()
         saveCfg()
@@ -571,6 +608,12 @@ class DashView(ctx: Context) : View(ctx) {
     @Volatile var tMaxRpm = 0
     @Volatile var tSpeed = 0f
     @Volatile var tStamp = 0L
+    @Volatile var tCur = -1
+    @Volatile var tLast = -1
+    @Volatile var tBest = -1
+    @Volatile var tDelta = Int.MIN_VALUE
+    @Volatile var tBump = 0
+    @Volatile var tGrip = 0
     val telemetryOn: Boolean get() = Cfg.telemetry && tMaxRpm > 0 && SystemClock.uptimeMillis() - tStamp < 1500
 
     val gas: Float get() = deadzone(pedal)
@@ -585,7 +628,7 @@ class DashView(ctx: Context) : View(ctx) {
     private val bgPaint = Paint()
     private val fontMono = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     private val fontCond = Typeface.create("sans-serif-condensed", Typeface.BOLD)
-    private var wx = 0f; private var wy = 0f; private var wr = 0f
+    private var cTop = 0f; private var cH = 1f; private var cCx = 0f; private var cW = 1f
     private var trackCy = 0f; private var halfLen = 1f; private var knobH = 60f
     private var pedalId = -1
     private var lastStep = 0
@@ -638,16 +681,17 @@ class DashView(ctx: Context) : View(ctx) {
         ledR.set(cl, m, cr, m + h * 0.07f)
         calR.set(w / 2f - cbw / 2f, h - m - gap - cbh, w / 2f + cbw / 2f, h - m - gap)
         val availH = calR.top - ledR.bottom
-        wr = min(availH / 2f - 12f, (cr - cl) / 2f - 6f)
-        wx = (cl + cr) / 2f
-        wy = ledR.bottom + availH / 2f
+        cTop = ledR.bottom + 10f
+        cH = availH - 30f
+        cCx = (cl + cr) / 2f
+        cW = cr - cl
     }
 
     override fun onDraw(c: Canvas) {
         c.drawPaint(bgPaint)
         drawLeds(c)
         drawPedalPanel(c)
-        drawWheel(c)
+        drawCenter(c)
 
         p.style = Paint.Style.FILL
         p.typeface = fontCond
@@ -674,7 +718,7 @@ class DashView(ctx: Context) : View(ctx) {
         p.typeface = fontMono
         p.color = APAGADO
         p.textSize = 22f
-        c.drawText(status + (if (telemetryOn) " · juego conectado" else ""), width / 2f, height - 4f, p)
+        c.drawText(status + (if (telemetryOn) " · juego conectado" else "") + (if (telemetryOn && Cfg.hapMode == 3) "  baches ${tBump}% agarre ${tGrip}%" else ""), width / 2f, height - 4f, p)
     }
 
     /** Tira de luces como la de un volante GT3: se enciende con el acelerador. */
@@ -698,64 +742,65 @@ class DashView(ctx: Context) : View(ctx) {
         }
     }
 
-    private fun drawWheel(c: Canvas) {
-        val a = wr * 0.8f
-        val b = wr * 0.6f
-        c.save()
-        c.rotate(steer * 135f, wx, wy)
+    private fun gearLabel(): String = when (tGear) { 0 -> "R"; 1 -> "N"; else -> (tGear - 1).toString() }
+
+    private fun fmtTime(ms: Int): String {
+        if (ms <= 0 || ms > 3_600_000) return "--:--.---"
+        return String.format(Locale.US, "%d:%02d.%03d", ms / 60000, (ms % 60000) / 1000, ms % 1000)
+    }
+
+    /** Centro: marcha grande, diferencia con tu mejor vuelta, tiempos y barra de dirección. */
+    private fun drawCenter(c: Canvas) {
+        val on = telemetryOn
+        val x = cCx
+        p.style = Paint.Style.FILL
+        p.textAlign = Paint.Align.CENTER
+
+        // marcha
+        p.typeface = fontMono
+        p.color = if (on && tGear != 1) NARANJA else APAGADO
+        p.textSize = cH * 0.46f
+        c.drawText(if (on) gearLabel() else "–", x, cTop + cH * 0.40f, p)
+
+        // diferencia: rojo y "+" = más lento que tu mejor vuelta, verde y "−" = más rápido
+        val d = tDelta
+        p.textSize = cH * 0.13f
+        if (on && d != Int.MIN_VALUE) {
+            p.color = if (d > 0) ROJO_GT else VERDE_GT
+            c.drawText(String.format(Locale.US, "%s%.3f", if (d > 0) "+" else "−", abs(d) / 1000f), x, cTop + cH * 0.56f, p)
+        } else {
+            p.color = APAGADO
+            c.drawText("--.---", x, cTop + cH * 0.56f, p)
+        }
+
+        // tiempos
+        val cols = listOf("ACTUAL" to tCur, "ÚLTIMA" to tLast, "MEJOR" to tBest)
+        cols.forEachIndexed { i, (name, ms) ->
+            val cx = x + (i - 1) * cW * 0.33f
+            p.typeface = fontCond; p.color = PLATA_OSC; p.textSize = cH * 0.05f
+            c.drawText(name, cx, cTop + cH * 0.68f, p)
+            p.typeface = fontMono; p.color = if (on) BLANCO else APAGADO; p.textSize = cH * 0.08f
+            c.drawText(if (on) fmtTime(ms) else "--:--.---", cx, cTop + cH * 0.78f, p)
+        }
+
+        // barra de dirección
+        val half = cW * 0.4f
+        val by = cTop + cH * 0.90f
         p.style = Paint.Style.STROKE
         p.strokeCap = Paint.Cap.ROUND
-        // aro rectangular
-        p.strokeWidth = wr * 0.12f
+        p.strokeWidth = 8f
         p.color = GRAFITO
-        tmp.set(wx - a, wy - b, wx + a, wy + b)
-        c.drawRoundRect(tmp, b * 0.75f, b * 0.75f, p)
-        // empuñaduras de alcántara
-        p.strokeWidth = wr * 0.2f
-        p.color = ALCANTARA
-        c.drawLine(wx - a, wy - b * 0.45f, wx - a, wy + b * 0.45f, p)
-        c.drawLine(wx + a, wy - b * 0.45f, wx + a, wy + b * 0.45f, p)
-        // barra central
-        p.strokeWidth = wr * 0.09f
+        c.drawLine(x - half, by, x + half, by, p)
+        p.strokeWidth = 4f
         p.color = PLATA_OSC
-        c.drawLine(wx - a, wy, wx + a, wy, p)
-        // marca de las 12 en punto
-        p.strokeCap = Paint.Cap.BUTT
-        p.strokeWidth = wr * 0.07f
-        p.color = NARANJA
-        c.drawLine(wx, wy - b - wr * 0.09f, wx, wy - b + wr * 0.09f, p)
-        // botones de colores
+        c.drawLine(x, by - 14f, x, by + 14f, p)
         p.style = Paint.Style.FILL
-        for ((dx, col) in listOf(-0.6f to ROJO_GT, -0.38f to AMARILLO_GT, 0.38f to AZUL_GT, 0.6f to VERDE_GT)) {
-            p.color = col
-            c.drawCircle(wx + dx * a, wy - wr * 0.2f, wr * 0.055f, p)
-        }
-        // centro
-        val hub = wr * 0.3f
-        p.color = 0xFF050607.toInt()
-        c.drawCircle(wx, wy, hub, p)
-        p.style = Paint.Style.STROKE
-        p.strokeWidth = 5f
         p.color = NARANJA
-        c.drawCircle(wx, wy, hub, p)
-        c.restore()
-
-        p.style = Paint.Style.FILL
+        c.drawCircle(x + steer * half, by, 16f, p)
         p.typeface = fontMono
-        p.color = NARANJA
-        p.textAlign = Paint.Align.CENTER
-        val angle = "${(steer * rangeDeg / 2f).roundToInt()}°"
-        if (telemetryOn) {
-            val g = when (tGear) { 0 -> "R"; 1 -> "N"; else -> (tGear - 1).toString() }
-            p.textSize = wr * 0.30f
-            c.drawText(g, wx, wy + wr * 0.07f, p)
-            p.textSize = wr * 0.09f
-            p.color = PLATA
-            c.drawText(angle, wx, wy + wr * 0.22f, p)
-        } else {
-            p.textSize = wr * 0.24f
-            c.drawText(angle, wx, wy + p.textSize / 3f, p)
-        }
+        p.color = PLATA
+        p.textSize = cH * 0.05f
+        c.drawText("${(steer * rangeDeg / 2f).roundToInt()}°", x, cTop + cH, p)
     }
 
     private fun drawPedalPanel(c: Canvas) {
