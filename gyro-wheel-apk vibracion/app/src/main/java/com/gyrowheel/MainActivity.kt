@@ -76,6 +76,7 @@ object Cfg {
     var dead = 0.04f       // zona muerta del pedal
     var smooth = 0.4f      // respuesta de la dirección
     var drift = false      // modo drift: freno de mano y embrague
+    var telemetry = true   // usar marcha y revoluciones del juego
 }
 
 class MainActivity : Activity(), SensorEventListener {
@@ -183,6 +184,8 @@ class MainActivity : Activity(), SensorEventListener {
             try {
                 val sock = DatagramSocket()
                 val ipAddr = InetAddress.getByName(target)
+                sock.soTimeout = 500
+                startReceiver(sock, d)
                 d.status = "Enviando a $target"
                 while (running) {
                     val msg = String.format(
@@ -249,6 +252,7 @@ class MainActivity : Activity(), SensorEventListener {
         Cfg.hapMode = p.getInt("mode", 0)
         Cfg.gearHaptic = p.getBoolean("gearhap", true)
         Cfg.drift = p.getBoolean("drift", false)
+        Cfg.telemetry = p.getBoolean("tele", true)
         range = p.getFloat("range", 180f)
         Cfg.level = p.getInt("lvl", 1)
         Cfg.invert = p.getBoolean("inv", false)
@@ -258,8 +262,31 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun saveCfg() {
         getSharedPreferences("gw", MODE_PRIVATE).edit()
-            .putInt("mode", Cfg.hapMode).putBoolean("gearhap", Cfg.gearHaptic).putBoolean("drift", Cfg.drift).putFloat("range", range).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
+            .putInt("mode", Cfg.hapMode).putBoolean("gearhap", Cfg.gearHaptic).putBoolean("drift", Cfg.drift).putBoolean("tele", Cfg.telemetry).putFloat("range", range).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
             .putFloat("dead", Cfg.dead).putFloat("smo", Cfg.smooth).apply()
+    }
+
+    /** Recibe del PC la marcha y las revoluciones del juego ("T,marcha,rpm,rpmMax,km/h"). */
+    private fun startReceiver(sock: DatagramSocket, d: DashView) {
+        Thread {
+            val buf = ByteArray(128)
+            while (running && !sock.isClosed) {
+                try {
+                    val pk = DatagramPacket(buf, buf.size)
+                    sock.receive(pk)
+                    val parts = String(pk.data, 0, pk.length).split(",")
+                    if (parts.size >= 5 && parts[0] == "T") {
+                        d.tGear = parts[1].trim().toInt()
+                        d.tRpm = parts[2].trim().toInt()
+                        d.tMaxRpm = parts[3].trim().toInt()
+                        d.tSpeed = parts[4].trim().toFloat()
+                        d.tStamp = SystemClock.uptimeMillis()
+                    }
+                } catch (e: java.net.SocketTimeoutException) {
+                } catch (e: Exception) {
+                }
+            }
+        }.start()
     }
 
     private fun pulse(ms: Long, amp: Int) {
@@ -374,6 +401,8 @@ class MainActivity : Activity(), SensorEventListener {
             else -> add(
                 hdr("Conexión"),
                 txt("PC actual: ${addr ?: "sin conectar"}"),
+                txt(if (d.telemetryOn) "Datos del juego: conectados" else "Datos del juego: sin señal (abre Assetto Corsa y entra a pista)"),
+                toggleRow("Usar datos del juego (marcha y luces)", Cfg.telemetry) { Cfg.telemetry = it },
                 action("Buscar otro PC") { changePc() },
                 action("Restablecer todos los ajustes") { resetCfg(); refresh() }
             )
@@ -423,7 +452,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun resetCfg() {
         Cfg.hapMode = 0; Cfg.gearHaptic = true; Cfg.level = 1; Cfg.invert = false
-        Cfg.dead = 0.04f; Cfg.smooth = 0.4f; Cfg.drift = false
+        Cfg.dead = 0.04f; Cfg.smooth = 0.4f; Cfg.drift = false; Cfg.telemetry = true
         range = 180f
         dash?.rangeDeg = range
         saveCfg()
@@ -537,6 +566,12 @@ class DashView(ctx: Context) : View(ctx) {
     var onPedal: () -> Unit = {}
     @Volatile var handbrake = false
     @Volatile var clutch = false
+    @Volatile var tGear = 1
+    @Volatile var tRpm = 0
+    @Volatile var tMaxRpm = 0
+    @Volatile var tSpeed = 0f
+    @Volatile var tStamp = 0L
+    val telemetryOn: Boolean get() = Cfg.telemetry && tMaxRpm > 0 && SystemClock.uptimeMillis() - tStamp < 1500
 
     val gas: Float get() = deadzone(pedal)
     val brake: Float get() = deadzone(-pedal)
@@ -639,7 +674,7 @@ class DashView(ctx: Context) : View(ctx) {
         p.typeface = fontMono
         p.color = APAGADO
         p.textSize = 22f
-        c.drawText(status, width / 2f, height - 4f, p)
+        c.drawText(status + (if (telemetryOn) " · juego conectado" else ""), width / 2f, height - 4f, p)
     }
 
     /** Tira de luces como la de un volante GT3: se enciende con el acelerador. */
@@ -647,7 +682,13 @@ class DashView(ctx: Context) : View(ctx) {
         val n = 15
         val cw = ledR.width() / n
         val rad = min(cw, ledR.height()) * 0.36f
-        val lit = ceil(gas * n).toInt()
+        // con datos del juego: sigue las revoluciones (desde el 70 %) y parpadea en el corte; sin datos: sigue el acelerador
+        val lit: Int = if (telemetryOn) {
+            val f = ((tRpm.toFloat() / tMaxRpm) - 0.70f) / 0.30f
+            if (tRpm >= tMaxRpm * 0.985f) {
+                if ((SystemClock.uptimeMillis() / 90) % 2L == 0L) n else 0
+            } else ceil(f.coerceIn(0f, 1f) * n).toInt()
+        } else ceil(gas * n).toInt()
         p.style = Paint.Style.FILL
         for (i in 0 until n) {
             p.color = if (i < lit) {
@@ -703,8 +744,18 @@ class DashView(ctx: Context) : View(ctx) {
         p.typeface = fontMono
         p.color = NARANJA
         p.textAlign = Paint.Align.CENTER
-        p.textSize = wr * 0.24f
-        c.drawText("${(steer * rangeDeg / 2f).roundToInt()}°", wx, wy + p.textSize / 3f, p)
+        val angle = "${(steer * rangeDeg / 2f).roundToInt()}°"
+        if (telemetryOn) {
+            val g = when (tGear) { 0 -> "R"; 1 -> "N"; else -> (tGear - 1).toString() }
+            p.textSize = wr * 0.30f
+            c.drawText(g, wx, wy + wr * 0.07f, p)
+            p.textSize = wr * 0.09f
+            p.color = PLATA
+            c.drawText(angle, wx, wy + wr * 0.22f, p)
+        } else {
+            p.textSize = wr * 0.24f
+            c.drawText(angle, wx, wy + p.textSize / 3f, p)
+        }
     }
 
     private fun drawPedalPanel(c: Canvas) {
