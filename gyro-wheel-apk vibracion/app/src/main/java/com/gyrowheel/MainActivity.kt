@@ -77,8 +77,9 @@ object Cfg {
     var smooth = 0.4f      // respuesta de la dirección
     var drift = false      // modo drift: freno de mano y embrague
     var telemetry = true   // usar marcha y revoluciones del juego
-    var bumpGain = 100     // fuerza de la vibración por baches (% )
-    var gripGain = 100     // fuerza de la vibración por límite de agarre (%)
+    var bumpGain = 150     // fuerza de la vibración por baches y curbs (%)
+    var gripGain = 100     // fuerza de la vibración por agarre perdido (%)
+    var limitGain = 100    // fuerza del aviso antes de perder agarre (%)
     var clutchInvert = false
 }
 
@@ -98,6 +99,13 @@ class MainActivity : Activity(), SensorEventListener {
     @Volatile private var inSettings = false
     private var holdUntil = 0L
     @Volatile private var searching = false
+    // FFB del juego: señales suavizadas y control de repetición de los pulsos.
+    private var ffbBump = 0f
+    private var ffbGrip = 0f
+    private var ffbLastBump = 0L
+    private var ffbLastGrip = 0L
+    private var ffbLimit = 0f
+    private var ffbLastLimit = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -183,6 +191,7 @@ class MainActivity : Activity(), SensorEventListener {
         if (s == null) { d.status = "Este celular no tiene sensor de movimiento"; return }
         sm.registerListener(this, s, SensorManager.SENSOR_DELAY_GAME)
         running = true
+        resetFfb()
         handler.removeCallbacks(ffbPump)
         handler.post(ffbPump)
         Thread {
@@ -258,8 +267,9 @@ class MainActivity : Activity(), SensorEventListener {
         Cfg.gearHaptic = p.getBoolean("gearhap", true)
         Cfg.drift = p.getBoolean("drift", false)
         Cfg.telemetry = p.getBoolean("tele", true)
-        Cfg.bumpGain = p.getInt("bump", 100)
+        Cfg.bumpGain = p.getInt("bump2", 150)   // clave nueva: todos parten del nuevo valor agresivo
         Cfg.gripGain = p.getInt("grip", 100)
+        Cfg.limitGain = p.getInt("limit", 100)
         Cfg.clutchInvert = p.getBoolean("cinv", false)
         range = p.getFloat("range", 180f)
         Cfg.level = p.getInt("lvl", 1)
@@ -270,24 +280,91 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun saveCfg() {
         getSharedPreferences("gw", MODE_PRIVATE).edit()
-            .putInt("mode", Cfg.hapMode).putBoolean("gearhap", Cfg.gearHaptic).putBoolean("drift", Cfg.drift).putBoolean("tele", Cfg.telemetry).putInt("bump", Cfg.bumpGain).putInt("grip", Cfg.gripGain).putBoolean("cinv", Cfg.clutchInvert).putFloat("range", range).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
+            .putInt("mode", Cfg.hapMode).putBoolean("gearhap", Cfg.gearHaptic).putBoolean("drift", Cfg.drift).putBoolean("tele", Cfg.telemetry).putInt("bump2", Cfg.bumpGain).putInt("limit", Cfg.limitGain).putInt("grip", Cfg.gripGain).putBoolean("cinv", Cfg.clutchInvert).putFloat("range", range).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
             .putFloat("dead", Cfg.dead).putFloat("smo", Cfg.smooth).apply()
     }
 
-    /** Modo FFB: vibra según los baches y el límite de agarre que informa el juego. */
+    /**
+     * Modo FFB: vibra según los baches, pianos y el límite de agarre que calcula el PC.
+     *
+     * Los valores llegan a 50 Hz y ya vienen limitados a 0..100. Aquí se suavizan
+     * para que la vibración no "tiemble" y se convierten en pulsos cortos:
+     * los baches son golpes secos y el límite de agarre es un zumbido continuo.
+     */
     private val ffbPump = object : Runnable {
         override fun run() {
             if (!running) return
             val d = dash
-            if (d != null && !inSettings && Cfg.hapMode == 3 && d.telemetryOn && SystemClock.uptimeMillis() >= holdUntil) {
-                val b = min(1f, d.tBump / 100f * (Cfg.bumpGain / 100f))
-                val g = min(1f, d.tGrip / 100f * (Cfg.gripGain / 100f))
-                val k = floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
-                if (b >= 0.1f) pulse(35, (40 + 215 * b * k).toInt())
-                else if (g >= 0.1f) pulse(70, (30 + 170 * g * k).toInt())
+            val now = SystemClock.uptimeMillis()
+            if (d == null || inSettings || Cfg.hapMode != 3 || !d.ffbOn) {
+                resetFfb()
+                handler.postDelayed(this, 50)
+                return
             }
-            handler.postDelayed(this, 40)
+
+            val targetBump = min(1f, d.tBump / 100f * (Cfg.bumpGain / 100f))
+            val targetGrip = min(1f, d.tGrip / 100f * (Cfg.gripGain / 100f))
+            val targetLimit = min(1f, d.tLimit / 100f * (Cfg.limitGain / 100f))
+            // Los golpes entran de inmediato; el resto sube y baja suave para no parpadear.
+            ffbBump += (targetBump - ffbBump) * if (targetBump > ffbBump) 0.90f else 0.25f
+            ffbGrip += (targetGrip - ffbGrip) * if (targetGrip > ffbGrip) 0.35f else 0.12f
+            ffbLimit += (targetLimit - ffbLimit) * if (targetLimit > ffbLimit) 0.40f else 0.20f
+            if (ffbBump < 0.01f) ffbBump = 0f
+            if (ffbGrip < 0.01f) ffbGrip = 0f
+            if (ffbLimit < 0.01f) ffbLimit = 0f
+
+            // Un clic de marcha o de tope de pedal tiene prioridad un instante.
+            if (now < holdUntil) {
+                handler.postDelayed(this, 40)
+                return
+            }
+
+            val k = 0.7f + 0.3f * floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
+            // 1) Curbs y baches (prioridad máxima): golpe largo y casi a toda la fuerza.
+            //    Un golpe grande da además un "mazazo" de 110 ms a tope. Repetidos sin
+            //    pausa se sienten como el traqueteo de un piano.
+            if (ffbBump >= 0.05f) {
+                if (ffbBump >= 0.45f && now - ffbLastBump >= 130L) {
+                    ffbLastBump = now
+                    pulse(110L, 255)
+                } else if (now - ffbLastBump >= 30L) {
+                    ffbLastBump = now
+                    pulse(80L, (255 * (0.55f + 0.45f * ffbBump) * k).toInt())
+                }
+                handler.postDelayed(this, 20)
+                return
+            }
+            // 2) Agarre perdido: zumbido continuo (pulsos solapados).
+            if (ffbGrip >= 0.08f) {
+                if (now - ffbLastGrip >= 55L) {
+                    ffbLastGrip = now
+                    pulse(55L, (30 + 150 * ffbGrip * k).toInt())
+                }
+                handler.postDelayed(this, 20)
+                return
+            }
+            // 3) A punto de perder agarre: tics cortos que se aceleran al acercarse al
+            //    límite (190 ms entre tics lejos, 60 ms casi encima). No se confunde con
+            //    el zumbido continuo del agarre perdido ni con los golpes de curb.
+            if (ffbLimit >= 0.08f) {
+                val period = (190f - 130f * ffbLimit).toLong()
+                if (now - ffbLastLimit >= period) {
+                    ffbLastLimit = now
+                    pulse(30L, (90 + 130 * ffbLimit * k).toInt())
+                }
+            }
+            handler.postDelayed(this, 20)
         }
+    }
+
+    /** Vuelve los filtros del FFB a cero (menús, pausa, cambio de PC o de ajustes). */
+    private fun resetFfb() {
+        ffbBump = 0f
+        ffbGrip = 0f
+        ffbLastBump = 0L
+        ffbLastGrip = 0L
+        ffbLimit = 0f
+        ffbLastLimit = 0L
     }
 
     /** Recibe del PC la marcha y las revoluciones del juego ("T,marcha,rpm,rpmMax,km/h"). */
@@ -311,6 +388,7 @@ class MainActivity : Activity(), SensorEventListener {
                             d.tDelta = if (parts[8].trim() == "N") Int.MIN_VALUE else parts[8].trim().toInt()
                             d.tBump = parts[9].trim().toInt()
                             d.tGrip = parts[10].trim().toInt()
+                            d.tLimit = if (parts.size >= 12) (parts[11].trim().toIntOrNull() ?: 0) else 0
                         }
                         d.tStamp = SystemClock.uptimeMillis()
                     }
@@ -324,8 +402,17 @@ class MainActivity : Activity(), SensorEventListener {
     private fun pulse(ms: Long, amp: Int) {
         val v = vib ?: return
         if (!v.hasVibrator()) return
-        if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createOneShot(ms, amp.coerceIn(1, 255)))
-        else @Suppress("DEPRECATION") v.vibrate(ms)
+        val a = amp.coerceIn(1, 255)
+        if (Build.VERSION.SDK_INT >= 26) {
+            val effect = if (v.hasAmplitudeControl()) {
+                VibrationEffect.createOneShot(ms, a)
+            } else {
+                // Sin control de intensidad: se acorta el pulso para que se sienta más suave.
+                val dur = (ms * (0.30f + 0.70f * a / 255f)).toLong().coerceAtLeast(10L)
+                VibrationEffect.createOneShot(dur, 255)
+            }
+            v.vibrate(effect)
+        } else @Suppress("DEPRECATION") v.vibrate(ms)
     }
 
     /** kind: 1 = cambio de marcha, 2 = tope del pedal, 3 = paso de acelerador a freno (siempre fuerte) */
@@ -333,6 +420,8 @@ class MainActivity : Activity(), SensorEventListener {
         when (kind) {
             1 -> if (!Cfg.gearHaptic) return
             2 -> if (Cfg.hapMode != 0) return
+            // El golpe al pasar de acelerar a frenar se mantiene también en modo
+            // FFB: es corto y el FFB se reanuda solo cuando termina.
             3 -> if (Cfg.hapMode == 2) return
         }
         val k = floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
@@ -413,8 +502,9 @@ class MainActivity : Activity(), SensorEventListener {
                 radios(listOf("Normal: sigue la fuerza de los pedales", "Simple: solo marcha y cambio de acelerador a freno", "Sin vibración", "FFB del juego: baches, curbs y límite de agarre"), Cfg.hapMode) { Cfg.hapMode = it },
                 toggleRow("Vibrar al cambiar de marcha", Cfg.gearHaptic) { Cfg.gearHaptic = it },
                 slider("Intensidad", 0, 2, Cfg.level, { listOf("Suave", "Media", "Fuerte")[it] }) { Cfg.level = it },
-                slider("Baches y curbs (modo FFB)", 0, 200, Cfg.bumpGain, { "$it %" }) { Cfg.bumpGain = it },
+                slider("Baches y curbs (modo FFB)", 0, 300, Cfg.bumpGain, { "$it %" }) { Cfg.bumpGain = it },
                 slider("Límite de agarre (modo FFB)", 0, 200, Cfg.gripGain, { "$it %" }) { Cfg.gripGain = it },
+                slider("Aviso antes de perder agarre (modo FFB)", 0, 200, Cfg.limitGain, { "$it %" }) { Cfg.limitGain = it },
                 action("Probar vibración") { testBuzz() }
             )
             1 -> add(
@@ -448,6 +538,10 @@ class MainActivity : Activity(), SensorEventListener {
     private fun showSettings() {
         val d = dash ?: return
         inSettings = true
+        // Sin telemetría vibrando detrás del menú.
+        resetFfb()
+        handler.removeCallbacks(ffbPump)
+        vib?.cancel()
         val root = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(CARBON) }
         val tabs = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(GRAFITO_OSC); setPadding(20, 20, 20, 20)
@@ -473,7 +567,12 @@ class MainActivity : Activity(), SensorEventListener {
     private fun closeSettings() {
         inSettings = false
         saveCfg()
+        resetFfb()
         dash?.let { setContentView(it) }
+        if (running) {
+            handler.removeCallbacks(ffbPump)
+            handler.post(ffbPump)
+        }
     }
 
     private fun changePc() {
@@ -481,6 +580,10 @@ class MainActivity : Activity(), SensorEventListener {
         running = false
         sm.unregisterListener(this)
         handler.removeCallbacks(pump)
+        handler.removeCallbacks(ffbPump)
+        resetFfb()
+        pumping = false
+        vib?.cancel()
         dash = null
         showConnect()
     }
@@ -488,7 +591,7 @@ class MainActivity : Activity(), SensorEventListener {
     private fun resetCfg() {
         Cfg.hapMode = 0; Cfg.gearHaptic = true; Cfg.level = 1; Cfg.invert = false
         Cfg.dead = 0.04f; Cfg.smooth = 0.4f; Cfg.drift = false; Cfg.telemetry = true
-        Cfg.bumpGain = 100; Cfg.gripGain = 100; Cfg.clutchInvert = false
+        Cfg.bumpGain = 150; Cfg.gripGain = 100; Cfg.limitGain = 100; Cfg.clutchInvert = false
         range = 180f
         dash?.rangeDeg = range
         saveCfg()
@@ -558,6 +661,7 @@ class MainActivity : Activity(), SensorEventListener {
         handler.removeCallbacks(pump)
         handler.removeCallbacks(ffbPump)
         pumping = false
+        resetFfb()
         vib?.cancel()
         saveCfg()
         sm.unregisterListener(this)
@@ -614,7 +718,10 @@ class DashView(ctx: Context) : View(ctx) {
     @Volatile var tDelta = Int.MIN_VALUE
     @Volatile var tBump = 0
     @Volatile var tGrip = 0
+    @Volatile var tLimit = 0
     val telemetryOn: Boolean get() = Cfg.telemetry && tMaxRpm > 0 && SystemClock.uptimeMillis() - tStamp < 1500
+    /** Para el FFB: si el juego deja de mandar datos (pausa, menú, boxes) se corta en seguida. */
+    val ffbOn: Boolean get() = telemetryOn && SystemClock.uptimeMillis() - tStamp < 400
 
     val gas: Float get() = deadzone(pedal)
     val brake: Float get() = deadzone(-pedal)
@@ -718,7 +825,7 @@ class DashView(ctx: Context) : View(ctx) {
         p.typeface = fontMono
         p.color = APAGADO
         p.textSize = 22f
-        c.drawText(status + (if (telemetryOn) " · juego conectado" else "") + (if (telemetryOn && Cfg.hapMode == 3) "  baches ${tBump}% agarre ${tGrip}%" else ""), width / 2f, height - 4f, p)
+        c.drawText(status + (if (telemetryOn) " · juego conectado" else "") + (if (telemetryOn && Cfg.hapMode == 3) "  baches ${tBump}% agarre ${tGrip}% límite ${tLimit}%" else ""), width / 2f, height - 4f, p)
     }
 
     /** Tira de luces como la de un volante GT3: se enciende con el acelerador. */
