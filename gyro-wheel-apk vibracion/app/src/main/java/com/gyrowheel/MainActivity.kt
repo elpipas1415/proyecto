@@ -5,6 +5,11 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Path
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.graphics.Paint
 import android.graphics.RadialGradient
 import android.graphics.RectF
@@ -48,6 +53,8 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.ceil
+import kotlin.math.cos
+import kotlin.math.sin
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -81,7 +88,15 @@ object Cfg {
     var gripGain = 100     // fuerza de la vibración por agarre perdido (%)
     var limitGain = 100    // fuerza del aviso antes de perder agarre (%)
     var clutchInvert = false
+    var knobStyle = 0      // perilla de la palanca: 0 aluminio, 1 carbono, 2 neón, 3 estriada
+    var barStyle = 0       // barras de la palanca: 0 segmentos, 1 continua, 2 ocultas
+    var accent = 0         // color de acento de la palanca (índice de ACENTOS)
+    var knobScale = 100    // tamaño visual de la perilla (%)
 }
+
+private val ACENTOS = intArrayOf(NARANJA, AZUL_GT, VERDE_GT, ROJO_GT, AMARILLO_GT, BLANCO)
+private const val MP = ViewGroup.LayoutParams.MATCH_PARENT
+private const val WC = ViewGroup.LayoutParams.WRAP_CONTENT
 
 class MainActivity : Activity(), SensorEventListener {
     private lateinit var sm: SensorManager
@@ -121,7 +136,6 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun showConnect() {
         val prefs = getSharedPreferences("gw", MODE_PRIVATE)
-        val serif = Typeface.create(Typeface.SERIF, Typeface.BOLD)
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -130,18 +144,21 @@ class MainActivity : Activity(), SensorEventListener {
         }
         val title = TextView(this).apply {
             text = "Gyromovil"; textSize = 34f; setTextColor(BLANCO); gravity = Gravity.CENTER
-            typeface = serif
+            typeface = sense(context)
         }
         val status = TextView(this).apply {
+            typeface = sense(context)
             setTextColor(NARANJA); gravity = Gravity.CENTER; setPadding(0, 10, 0, 10)
         }
         val ip = EditText(this).apply {
+            typeface = sense(context)
             setText(prefs.getString("ip", ""))
             hint = "o escribe la IP (192.168.1.20)"
             setTextColor(BLANCO); setHintTextColor(Color.GRAY); gravity = Gravity.CENTER
             setSingleLine()
         }
         val go = Button(this).apply {
+            typeface = sense(context)
             text = "Conectar"
             setOnClickListener {
                 searching = false
@@ -161,7 +178,7 @@ class MainActivity : Activity(), SensorEventListener {
                 startDash()
             }, { status.text = "No encontré el PC. Abre el servidor en la PC o escribe la IP." })
         }
-        val again = Button(this).apply { text = "Buscar de nuevo"; setOnClickListener { find() } }
+        val again = Button(this).apply { typeface = sense(context); text = "Buscar de nuevo"; setOnClickListener { find() } }
         box.addView(title); box.addView(status); box.addView(ip); box.addView(go); box.addView(again)
         setContentView(box)
         find()
@@ -170,11 +187,6 @@ class MainActivity : Activity(), SensorEventListener {
     private fun startDash() {
         val d = DashView(this)
         d.onCenter = { offset = raw; smooth = 0f }
-        d.onRange = {
-            range = when (range) { 120f -> 180f; 180f -> 270f; 270f -> 360f; else -> 120f }
-            d.rangeDeg = range
-            saveCfg()
-        }
         d.rangeDeg = range
         d.onHaptic = { buzz(it) }
         d.onPedal = { startPump() }
@@ -276,11 +288,16 @@ class MainActivity : Activity(), SensorEventListener {
         Cfg.invert = p.getBoolean("inv", false)
         Cfg.dead = p.getFloat("dead", 0.04f)
         Cfg.smooth = p.getFloat("smo", 0.4f)
+        Cfg.knobStyle = p.getInt("kst", 0)
+        Cfg.barStyle = p.getInt("bst", 0)
+        Cfg.accent = p.getInt("acc", 0)
+        Cfg.knobScale = p.getInt("ksc", 100)
     }
 
     private fun saveCfg() {
         getSharedPreferences("gw", MODE_PRIVATE).edit()
             .putInt("mode", Cfg.hapMode).putBoolean("gearhap", Cfg.gearHaptic).putBoolean("drift", Cfg.drift).putBoolean("tele", Cfg.telemetry).putInt("bump2", Cfg.bumpGain).putInt("limit", Cfg.limitGain).putInt("grip", Cfg.gripGain).putBoolean("cinv", Cfg.clutchInvert).putFloat("range", range).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
+            .putInt("kst", Cfg.knobStyle).putInt("bst", Cfg.barStyle).putInt("acc", Cfg.accent).putInt("ksc", Cfg.knobScale)
             .putFloat("dead", Cfg.dead).putFloat("smo", Cfg.smooth).apply()
     }
 
@@ -445,23 +462,57 @@ class MainActivity : Activity(), SensorEventListener {
     // ---- pantalla de ajustes ----
     private fun tint(c: Int) = ColorStateList.valueOf(c)
 
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
+
+    private fun rounded(fill: Int, stroke: Int, r: Int) = GradientDrawable().apply {
+        setColor(fill); cornerRadius = dp(r).toFloat(); setStroke(dp(1), stroke)
+    }
+
+    /** Fondo con onda al tocar, para botones y opciones. */
+    private fun pressable(d: Drawable): Drawable = RippleDrawable(tint(0x33FFFFFF), d, null)
+
+    private fun lp(w: Int, h: Int, top: Int = 0) = LinearLayout.LayoutParams(w, h).apply { topMargin = dp(top) }
+
     private fun hdr(t: String) = TextView(this).apply {
-        text = t; textSize = 22f; setTextColor(NARANJA); setPadding(0, 24, 0, 8)
-        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+        text = t; textSize = 26f; setTextColor(NARANJA); setPadding(dp(4), dp(4), 0, dp(12))
+        typeface = sense(context); letterSpacing = 0.05f
     }
 
     private fun txt(t: String) = TextView(this).apply {
-        text = t; textSize = 16f; setTextColor(BLANCO); setPadding(0, 16, 0, 4)
+        text = t; textSize = 15f; setTextColor(PLATA); setPadding(0, dp(10), 0, dp(2)); typeface = sense(context)
+    }
+
+    /** Agrupa opciones relacionadas en una tarjeta. */
+    private fun card(vararg v: View) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = rounded(GRAFITO_OSC, GRAFITO, 14)
+        setPadding(dp(16), dp(8), dp(16), dp(14))
+        v.forEach { addView(it) }
+        layoutParams = lp(MP, WC).apply { bottomMargin = dp(12) }
     }
 
     private fun toggleRow(t: String, on: Boolean, f: (Boolean) -> Unit) = Switch(this).apply {
-        text = t; textSize = 16f; isChecked = on; setTextColor(BLANCO); thumbTintList = tint(NARANJA)
-        setPadding(0, 16, 0, 8)
+        typeface = sense(context); text = t; textSize = 15f; isChecked = on; setTextColor(BLANCO)
+        val chk = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+        thumbTintList = ColorStateList(chk, intArrayOf(NARANJA, PLATA_OSC))
+        trackTintList = ColorStateList(chk, intArrayOf(0x66FF7A1A, ALCANTARA))
+        setPadding(0, dp(12), 0, dp(8))
         setOnCheckedChangeListener { _, v -> f(v) }
     }
 
     private fun slider(label: String, min: Int, max: Int, cur: Int, fmt: (Int) -> String, f: (Int) -> Unit): LinearLayout {
-        val l = txt("$label: ${fmt(cur)}")
+        val value = TextView(this).apply { textSize = 16f; setTextColor(NARANJA); setPadding(0, dp(10), 0, 0) }
+        fun show(x: Int) {
+            val s = fmt(x)
+            value.text = s
+            // los números van en monoespaciada; el texto, en Sense
+            value.typeface = if (s.any { it.isDigit() }) Typeface.create(Typeface.MONOSPACE, Typeface.BOLD) else sense(this)
+        }
+        show(cur)
+        val head = LinearLayout(this).apply {
+            addView(txt(label), lp(0, WC).apply { weight = 1f })
+            addView(value)
+        }
         val s = SeekBar(this).apply {
             this.max = max - min
             progress = cur - min
@@ -469,65 +520,128 @@ class MainActivity : Activity(), SensorEventListener {
             thumbTintList = tint(NARANJA)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, user: Boolean) {
-                    l.text = "$label: ${fmt(p + min)}"
+                    show(p + min)
                     f(p + min)
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
-        return LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(l); addView(s) }
+        return LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(head); addView(s) }
     }
 
-    private fun radios(options: List<String>, cur: Int, f: (Int) -> Unit) = RadioGroup(this).apply {
-        options.forEachIndexed { i, o ->
-            addView(RadioButton(this@MainActivity).apply {
-                id = 1000 + i; text = o; textSize = 16f; setTextColor(BLANCO)
-                buttonTintList = tint(NARANJA); isChecked = i == cur
-                setPadding(8, 12, 8, 12)
-            })
+    /** Opciones excluyentes como botones; row = true las pone en fila (para nombres cortos). */
+    private fun choice(options: List<String>, cur: Int, row: Boolean = false, f: (Int) -> Unit): LinearLayout {
+        val box = LinearLayout(this).apply { orientation = if (row) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL }
+        val items = ArrayList<TextView>()
+        fun paint(sel: Int) = items.forEachIndexed { i, tv ->
+            tv.background = pressable(rounded(if (i == sel) 0x33FF7A1A else 0xFF1B1F23.toInt(), if (i == sel) NARANJA else GRAFITO, 10))
+            tv.setTextColor(if (i == sel) BLANCO else PLATA)
         }
-        setOnCheckedChangeListener { _, id -> f(id - 1000) }
+        options.forEachIndexed { i, o ->
+            val tv = TextView(this).apply {
+                text = o; textSize = 15f; typeface = sense(context)
+                if (row) gravity = Gravity.CENTER
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                setOnClickListener { paint(i); f(i) }
+            }
+            items.add(tv)
+            box.addView(tv, if (row) lp(0, WC, 6).apply { weight = 1f; marginEnd = dp(6) } else lp(MP, WC, 6))
+        }
+        paint(cur)
+        return box
     }
 
-    private fun action(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
+    /** Círculos de color para elegir el acento de la palanca. */
+    private fun swatches(cur: Int, f: (Int) -> Unit): LinearLayout {
+        val rowL = LinearLayout(this)
+        val dots = ArrayList<View>()
+        fun paint(sel: Int) = dots.forEachIndexed { i, d ->
+            d.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(ACENTOS[i])
+                setStroke(dp(if (i == sel) 3 else 1), if (i == sel) BLANCO else GRAFITO)
+            }
+        }
+        ACENTOS.indices.forEach { i ->
+            val d = View(this).apply { setOnClickListener { paint(i); f(i) } }
+            dots.add(d)
+            rowL.addView(d, lp(dp(36), dp(36), 8).apply { marginEnd = dp(10) })
+        }
+        paint(cur)
+        return rowL
+    }
+
+    private fun action(t: String, f: () -> Unit) = Button(this).apply {
+        typeface = sense(context); text = t; setAllCaps(false); textSize = 15f; setTextColor(BLANCO)
+        background = pressable(rounded(GRAFITO, PLATA_OSC, 12))
+        setOnClickListener { f() }
+        layoutParams = lp(MP, WC, 8)
+    }
 
     private fun page(i: Int, d: DashView, refresh: () -> Unit): View {
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 16, 48, 40) }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(14), dp(24), dp(24)) }
         fun add(vararg v: View) = v.forEach { col.addView(it) }
         when (i) {
             0 -> add(
                 hdr("Vibración"),
-                txt("Modo"),
-                radios(listOf("Normal: sigue la fuerza de los pedales", "Simple: solo marcha y cambio de acelerador a freno", "Sin vibración", "FFB del juego: baches, curbs y límite de agarre"), Cfg.hapMode) { Cfg.hapMode = it },
-                toggleRow("Vibrar al cambiar de marcha", Cfg.gearHaptic) { Cfg.gearHaptic = it },
-                slider("Intensidad", 0, 2, Cfg.level, { listOf("Suave", "Media", "Fuerte")[it] }) { Cfg.level = it },
-                slider("Baches y curbs (modo FFB)", 0, 300, Cfg.bumpGain, { "$it %" }) { Cfg.bumpGain = it },
-                slider("Límite de agarre (modo FFB)", 0, 200, Cfg.gripGain, { "$it %" }) { Cfg.gripGain = it },
-                slider("Aviso antes de perder agarre (modo FFB)", 0, 200, Cfg.limitGain, { "$it %" }) { Cfg.limitGain = it },
+                card(
+                    txt("Modo"),
+                    choice(listOf("Normal: sigue la fuerza de los pedales", "Simple: solo marcha y cambio de acelerador a freno", "Sin vibración", "FFB del juego: baches, curbs y límite de agarre"), Cfg.hapMode) { Cfg.hapMode = it },
+                    toggleRow("Vibrar al cambiar de marcha", Cfg.gearHaptic) { Cfg.gearHaptic = it }
+                ),
+                card(
+                    slider("Intensidad", 0, 2, Cfg.level, { listOf("Suave", "Media", "Fuerte")[it] }) { Cfg.level = it },
+                    slider("Baches y curbs (modo FFB)", 0, 300, Cfg.bumpGain, { "$it %" }) { Cfg.bumpGain = it },
+                    slider("Límite de agarre (modo FFB)", 0, 200, Cfg.gripGain, { "$it %" }) { Cfg.gripGain = it },
+                    slider("Aviso antes de perder agarre (modo FFB)", 0, 200, Cfg.limitGain, { "$it %" }) { Cfg.limitGain = it }
+                ),
                 action("Probar vibración") { testBuzz() }
             )
             1 -> add(
                 hdr("Dirección"),
-                slider("Giro total", 90, 540, range.roundToInt().coerceIn(90, 540), { "$it°" }) { range = it.toFloat(); d.rangeDeg = range },
-                slider("Respuesta", 1, 9, (Cfg.smooth * 10f).roundToInt().coerceIn(1, 9), { "${it * 10} %" }) { Cfg.smooth = it / 10f },
-                toggleRow("Invertir dirección", Cfg.invert) { Cfg.invert = it },
+                card(
+                    slider("Giro total", 90, 540, range.roundToInt().coerceIn(90, 540), { "$it°" }) { range = it.toFloat(); d.rangeDeg = range },
+                    slider("Respuesta", 1, 9, (Cfg.smooth * 10f).roundToInt().coerceIn(1, 9), { "${it * 10} %" }) { Cfg.smooth = it / 10f },
+                    toggleRow("Invertir dirección", Cfg.invert) { Cfg.invert = it }
+                ),
                 action("Centrar volante") { offset = raw; smooth = 0f }
             )
-            2 -> add(
-                hdr("Pedales"),
-                slider("Zona muerta", 0, 15, (Cfg.dead * 100f).roundToInt().coerceIn(0, 15), { "$it %" }) { Cfg.dead = it / 100f }
-            )
+            2 -> {
+                val prev = PedalPreview(this)
+                val opts = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(card(slider("Zona muerta", 0, 15, (Cfg.dead * 100f).roundToInt().coerceIn(0, 15), { "$it %" }) { Cfg.dead = it / 100f }))
+                    addView(card(
+                        txt("Estilo de perilla"),
+                        choice(listOf("Aluminio", "Carbono", "Neón", "Estriada"), Cfg.knobStyle, true) { Cfg.knobStyle = it; prev.invalidate() },
+                        txt("Barras"),
+                        choice(listOf("Segmentos", "Continua", "Ocultas"), Cfg.barStyle, true) { Cfg.barStyle = it; prev.invalidate() },
+                        txt("Color de acento"),
+                        swatches(Cfg.accent) { Cfg.accent = it; prev.invalidate() },
+                        slider("Tamaño de perilla", 70, 130, Cfg.knobScale, { "$it %" }) { Cfg.knobScale = it; prev.invalidate() }
+                    ))
+                }
+                val rowL = LinearLayout(this).apply {
+                    addView(opts, lp(0, WC).apply { weight = 1f })
+                    addView(prev, lp(dp(110), dp(240), 4).apply { marginStart = dp(12) })
+                }
+                add(hdr("Pedales"), rowL)
+            }
             3 -> add(
                 hdr("Modo de juego"),
-                radios(listOf("Carrera: marchas y pedales", "Drift: agrega freno de mano y embrague"), if (Cfg.drift) 1 else 0) { Cfg.drift = it == 1 },
-                toggleRow("Invertir embrague (si en el juego va al revés)", Cfg.clutchInvert) { Cfg.clutchInvert = it }
+                card(
+                    choice(listOf("Carrera: marchas y pedales", "Drift: agrega freno de mano y embrague"), if (Cfg.drift) 1 else 0) { Cfg.drift = it == 1 },
+                    toggleRow("Invertir embrague (si en el juego va al revés)", Cfg.clutchInvert) { Cfg.clutchInvert = it }
+                )
             )
             else -> add(
                 hdr("Conexión"),
-                txt("PC actual: ${addr ?: "sin conectar"}"),
-                txt(if (d.telemetryOn) "Datos del juego: conectados" else "Datos del juego: sin señal (abre Assetto Corsa y entra a pista)"),
-                toggleRow("Usar datos del juego (marcha y luces)", Cfg.telemetry) { Cfg.telemetry = it },
+                card(
+                    txt("PC actual: ${addr ?: "sin conectar"}"),
+                    txt(if (d.telemetryOn) "Datos del juego: conectados" else "Datos del juego: sin señal (abre Assetto Corsa y entra a pista)"),
+                    toggleRow("Usar datos del juego (marcha y luces)", Cfg.telemetry) { Cfg.telemetry = it }
+                ),
                 action("Buscar otro PC") { changePc() },
                 action("Restablecer todos los ajustes") { resetCfg(); refresh() }
             )
@@ -544,22 +658,36 @@ class MainActivity : Activity(), SensorEventListener {
         vib?.cancel()
         val root = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(CARBON) }
         val tabs = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setBackgroundColor(GRAFITO_OSC); setPadding(20, 20, 20, 20)
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFF0B0C0E.toInt()); setPadding(dp(14), dp(14), dp(14), dp(14))
         }
         val content = ScrollView(this)
+        val tabViews = ArrayList<TextView>()
         var current = 0
+        fun mark(sel: Int) = tabViews.forEachIndexed { k, tv ->
+            tv.background = pressable(rounded(if (k == sel) 0x33FF7A1A else 0xFF15181B.toInt(), if (k == sel) NARANJA else GRAFITO, 12))
+            tv.setTextColor(if (k == sel) BLANCO else PLATA)
+        }
         fun show(i: Int) {
             current = i
+            mark(i)
             content.removeAllViews()
             content.addView(page(i, d) { show(current) })
         }
+        tabs.addView(TextView(this).apply {
+            text = "Ajustes"; textSize = 26f; setTextColor(BLANCO); typeface = sense(context)
+            letterSpacing = 0.05f; setPadding(dp(6), dp(2), 0, dp(10))
+        })
         listOf("Vibración", "Dirección", "Pedales", "Modo", "Conexión").forEachIndexed { i, n ->
-            tabs.addView(action(n) { show(i) })
+            val tv = TextView(this).apply {
+                text = n; textSize = 17f; typeface = sense(context)
+                setPadding(dp(16), dp(14), dp(12), dp(14)); setOnClickListener { show(i) }
+            }
+            tabViews.add(tv)
+            tabs.addView(tv, lp(MP, WC, 6))
         }
-        tabs.addView(action("← Volver") { closeSettings() })
-        val mp = ViewGroup.LayoutParams.MATCH_PARENT
-        root.addView(ScrollView(this).apply { addView(tabs) }, LinearLayout.LayoutParams(0, mp, 0.3f))
-        root.addView(content, LinearLayout.LayoutParams(0, mp, 0.7f))
+        tabs.addView(action("← Volver") { closeSettings() }, lp(MP, WC, 18))
+        root.addView(ScrollView(this).apply { addView(tabs) }, LinearLayout.LayoutParams(0, MP, 0.28f))
+        root.addView(content, LinearLayout.LayoutParams(0, MP, 0.72f))
         setContentView(root)
         show(0)
     }
@@ -592,6 +720,7 @@ class MainActivity : Activity(), SensorEventListener {
         Cfg.hapMode = 0; Cfg.gearHaptic = true; Cfg.level = 1; Cfg.invert = false
         Cfg.dead = 0.04f; Cfg.smooth = 0.4f; Cfg.drift = false; Cfg.telemetry = true
         Cfg.bumpGain = 150; Cfg.gripGain = 100; Cfg.limitGain = 100; Cfg.clutchInvert = false
+        Cfg.knobStyle = 0; Cfg.barStyle = 0; Cfg.accent = 0; Cfg.knobScale = 100
         range = 180f
         dash?.rangeDeg = range
         saveCfg()
@@ -692,6 +821,91 @@ class MainActivity : Activity(), SensorEventListener {
     override fun onAccuracyChanged(s: Sensor?, a: Int) {}
 }
 
+private var senseTf: Typeface? = null
+/** Fuente de las letras (assets/fonts/sensefont.ttf); los números del HUD siguen en monoespaciada. */
+private fun sense(c: Context): Typeface = senseTf ?: Typeface.createFromAsset(c.assets, "fonts/sensefont.ttf").also { senseTf = it }
+
+/** Barras de la palanca: verde sube (acelerador), rojo baja (freno), alrededor de la línea central cy. */
+private fun drawBars(c: Canvas, p: Paint, t: RectF, cx: Float, cy: Float, half: Float, bw: Float, gas: Float, brake: Float) {
+    if (Cfg.barStyle == 2) return
+    p.style = Paint.Style.FILL
+    val off = 0xFF1B1F23.toInt()
+    if (Cfg.barStyle == 1) {
+        t.set(cx - bw / 2f, cy - half, cx + bw / 2f, cy + half)
+        p.color = off
+        c.drawRoundRect(t, 8f, 8f, p)
+        if (gas > 0f) { t.set(cx - bw / 2f, cy - gas * half, cx + bw / 2f, cy); p.color = VERDE_GT; c.drawRoundRect(t, 8f, 8f, p) }
+        if (brake > 0f) { t.set(cx - bw / 2f, cy, cx + bw / 2f, cy + brake * half); p.color = ROJO_GT; c.drawRoundRect(t, 8f, 8f, p) }
+        return
+    }
+    val n = 10
+    val step = half / n
+    val gap = 5f
+    for (i in 0 until n) {
+        t.set(cx - bw / 2f, cy - (i + 1) * step + gap / 2f, cx + bw / 2f, cy - i * step - gap / 2f)
+        p.color = if (gas * n > i) VERDE_GT else off
+        c.drawRoundRect(t, 6f, 6f, p)
+        t.set(cx - bw / 2f, cy + i * step + gap / 2f, cx + bw / 2f, cy + (i + 1) * step - gap / 2f)
+        p.color = if (brake * n > i) ROJO_GT else off
+        c.drawRoundRect(t, 6f, 6f, p)
+    }
+}
+
+/** Perilla de la palanca según Cfg.knobStyle, con la línea central en el color de acento. */
+private fun drawKnob(c: Canvas, p: Paint, t: RectF, cx: Float, ky: Float, kw: Float, kh: Float) {
+    val acc = ACENTOS[Cfg.accent.coerceIn(0, ACENTOS.size - 1)]
+    t.set(cx - kw / 2f, ky - kh / 2f, cx + kw / 2f, ky + kh / 2f)
+    p.style = Paint.Style.FILL
+    when (Cfg.knobStyle) {
+        1 -> {   // carbono
+            p.color = PLATA_OSC; c.drawRoundRect(t, 12f, 12f, p)
+            t.inset(4f, 4f)
+            p.color = 0xFF16181B.toInt(); c.drawRoundRect(t, 9f, 9f, p)
+        }
+        2 -> {   // neón: halo suave y borde de color
+            p.color = 0xFF0A0B0D.toInt(); c.drawRoundRect(t, 12f, 12f, p)
+            p.style = Paint.Style.STROKE
+            p.color = acc; p.alpha = 70; p.strokeWidth = 14f; c.drawRoundRect(t, 12f, 12f, p)
+            p.color = acc; p.strokeWidth = 4f; c.drawRoundRect(t, 12f, 12f, p)
+        }
+        else -> {   // aluminio (y estriada)
+            p.color = PLATA_OSC; c.drawRoundRect(t, 12f, 12f, p)
+            t.inset(4f, 4f)
+            p.color = PLATA; c.drawRoundRect(t, 9f, 9f, p)
+        }
+    }
+    if (Cfg.knobStyle == 3) {
+        p.style = Paint.Style.STROKE; p.strokeWidth = 2f; p.color = PLATA_OSC
+        for (k in intArrayOf(-2, -1, 1, 2)) {
+            val y = ky + k * kh * 0.17f
+            c.drawLine(cx - kw / 2f + 14f, y, cx + kw / 2f - 14f, y, p)
+        }
+    }
+    p.style = Paint.Style.STROKE
+    p.strokeCap = Paint.Cap.BUTT
+    p.strokeWidth = 5f
+    p.color = acc
+    c.drawLine(cx - kw / 2f + 14f, ky, cx + kw / 2f - 14f, ky, p)
+}
+
+/** Vista previa de la palanca dentro de Ajustes → Pedales; se repinta al cambiar un estilo. */
+class PedalPreview(ctx: Context) : View(ctx) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val t = RectF()
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat()
+        t.set(2f, 2f, w - 2f, h - 2f)
+        p.style = Paint.Style.FILL; p.color = 0xFF0A0B0D.toInt()
+        c.drawRoundRect(t, 22f, 22f, p)
+        p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = PLATA_OSC
+        c.drawRoundRect(t, 22f, 22f, p)
+        val half = h * 0.36f
+        drawBars(c, p, t, w / 2f, h / 2f, half, w * 0.34f, 0.6f, 0f)
+        val sc = Cfg.knobScale / 100f
+        drawKnob(c, p, t, w / 2f, h / 2f - 0.6f * half, min(w * 0.8f * sc, w * 0.94f), h * 0.085f * sc)
+    }
+}
+
 class DashView(ctx: Context) : View(ctx) {
     @Volatile var steer = 0f
     /** Palanca única: -1 (freno a fondo) ... 0 (reposo) ... +1 (acelerador a fondo) */
@@ -701,7 +915,6 @@ class DashView(ctx: Context) : View(ctx) {
     @Volatile var rangeDeg = 180f
     @Volatile var status = ""
     var onCenter: () -> Unit = {}
-    var onRange: () -> Unit = {}
     var onSettings: () -> Unit = {}
     var onHaptic: (Int) -> Unit = {}
     var onPedal: () -> Unit = {}
@@ -728,13 +941,13 @@ class DashView(ctx: Context) : View(ctx) {
     private fun deadzone(x: Float) = if (x < Cfg.dead) 0f else (x - Cfg.dead) / (1f - Cfg.dead)
 
     private val pedalR = RectF(); private val upR = RectF(); private val downR = RectF()
-    private val calR = RectF(); private val rangeR = RectF(); private val settingsR = RectF()
+    private val calR = RectF(); private val settingsR = RectF()
     private val ledR = RectF(); private val tmp = RectF()
     private val handR = RectF(); private val clutchR = RectF()
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bgPaint = Paint()
     private val fontMono = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-    private val fontCond = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    private val fontCond = sense(ctx)
     private var cTop = 0f; private var cH = 1f; private var cCx = 0f; private var cW = 1f
     private var trackCy = 0f; private var halfLen = 1f; private var knobH = 60f
     private var pedalId = -1
@@ -758,7 +971,15 @@ class DashView(ctx: Context) : View(ctx) {
         bgPaint.shader = BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
     }
 
-    override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+    private var laidDrift = false
+    private val gearPath = Path()
+    private var gearShader: Shader? = null
+    private var settingsBg: Shader? = null
+
+    override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) = layout(w, h)
+
+    private fun layout(w: Int, h: Int) {
+        laidDrift = Cfg.drift
         val m = 20f
         val sideW = w * 0.2f
         val gap = 14f
@@ -768,19 +989,26 @@ class DashView(ctx: Context) : View(ctx) {
         knobH = hh * 0.085f
         trackCy = pedalR.centerY()
         halfLen = hh * 0.5f - hh * 0.22f - knobH / 2f
-        // Izquierda: ajustes, giro y marchas
+        // Izquierda: giro y marchas apiladas (+ arriba, − abajo); en drift se reserva abajo freno de mano y embrague
         val cbh = h * 0.13f
-        settingsR.set(m, m, m + sideW, m + cbh)
-        rangeR.set(m, m + cbh + gap, m + sideW, m + 2 * cbh + gap)
+        settingsR.set(m, m, m + sideW, m + cbh)   // engranaje arriba a la izquierda
+        buildGear(settingsR.centerX(), settingsR.centerY(), settingsR.height() * 0.38f)
+        settingsBg = LinearGradient(0f, settingsR.top, 0f, settingsR.bottom, GRAFITO, GRAFITO_OSC, Shader.TileMode.CLAMP)
         val gb = (sideW - gap) / 2f
-        val gy = h / 2f - gb / 2f + cbh * 0.5f
-        downR.set(m, gy, m + gb, gy + gb)
-        upR.set(m + gb + gap, gy, m + sideW, gy + gb)
         gearCaptionX = m + sideW / 2f
-        gearCaptionY = gy - 16f
-        handR.set(m, gy + gb + 44f, m + gb, gy + 2 * gb + 44f)
-        clutchR.set(m + gb + gap, gy + gb + 44f, m + sideW, gy + 2 * gb + 44f)
-        driftCaptionY = gy + gb + 34f
+        gearCaptionY = m + cbh + gap + 24f
+        val gTop = gearCaptionY + 10f
+        val bottom = h - m
+        var gEnd = bottom
+        if (Cfg.drift) {
+            handR.set(m, bottom - gb, m + gb, bottom)
+            clutchR.set(m + gb + gap, bottom - gb, m + sideW, bottom)
+            driftCaptionY = bottom - gb - 12f
+            gEnd = bottom - gb - 44f
+        }
+        val gh = (gEnd - gTop - gap) / 2f
+        upR.set(m, gTop, m + sideW, gTop + gh)
+        downR.set(m, gTop + gh + gap, m + sideW, gEnd)
         // Centro: tira de luces, volante y botón de centrar
         val cl = m + sideW + gap
         val cr = pedalR.left - gap
@@ -795,6 +1023,7 @@ class DashView(ctx: Context) : View(ctx) {
     }
 
     override fun onDraw(c: Canvas) {
+        if (laidDrift != Cfg.drift) layout(width, height)
         c.drawPaint(bgPaint)
         drawLeds(c)
         drawPedalPanel(c)
@@ -806,8 +1035,8 @@ class DashView(ctx: Context) : View(ctx) {
         p.textAlign = Paint.Align.CENTER
         p.textSize = 26f
         c.drawText("MARCHA", gearCaptionX, gearCaptionY, p)
-        button(c, downR, "−", down, downR.height() * 0.7f, AZUL_GT)
-        button(c, upR, "+", up, downR.height() * 0.7f, NARANJA)
+        button(c, downR, "−", down, downR.height() * 0.4f, AZUL_GT)
+        button(c, upR, "+", up, downR.height() * 0.4f, NARANJA)
         if (Cfg.drift) {
             p.style = Paint.Style.FILL
             p.typeface = fontCond
@@ -819,13 +1048,54 @@ class DashView(ctx: Context) : View(ctx) {
             button(c, clutchR, "Embrague", clutch, 34f, AMARILLO_GT)
         }
         button(c, calR, "Centrar", false, min(calR.height() * 0.42f, 34f), PLATA_OSC)
-        button(c, rangeR, "Giro ${rangeDeg.roundToInt()}°", false, min(rangeR.height() * 0.42f, 34f), PLATA_OSC)
-        button(c, settingsR, "Ajustes", false, min(settingsR.height() * 0.42f, 34f), PLATA_OSC)
+        drawSettingsButton(c)
 
         p.typeface = fontMono
         p.color = APAGADO
         p.textSize = 22f
         c.drawText(status + (if (telemetryOn) " · juego conectado" else "") + (if (telemetryOn && Cfg.hapMode == 3) "  baches ${tBump}% agarre ${tGrip}% límite ${tLimit}%" else ""), width / 2f, height - 4f, p)
+    }
+
+    /** Engranaje de 10 dientes con agujero; se arma una vez por tamaño de pantalla. */
+    private fun buildGear(cx: Float, cy: Float, r: Float) {
+        val n = 10
+        val step = Math.toRadians(360.0 / n)
+        val root = r * 0.78f
+        gearPath.reset()
+        gearPath.fillType = Path.FillType.EVEN_ODD
+        for (i in 0 until n) {
+            val a = step * i
+            // cada diente: base ancha sobre el cuerpo y punta más angosta
+            val pts = listOf(a - step * 0.30 to root, a - step * 0.16 to r, a + step * 0.16 to r, a + step * 0.30 to root)
+            pts.forEachIndexed { k, (ang, rad) ->
+                val x = (cx + rad * cos(ang)).toFloat()
+                val y = (cy + rad * sin(ang)).toFloat()
+                if (i == 0 && k == 0) gearPath.moveTo(x, y) else gearPath.lineTo(x, y)
+            }
+        }
+        gearPath.close()
+        gearPath.addCircle(cx, cy, r * 0.30f, Path.Direction.CW)
+        gearShader = RadialGradient(cx - r * 0.35f, cy - r * 0.35f, r * 1.7f, PLATA, PLATA_OSC, Shader.TileMode.CLAMP)
+    }
+
+    private fun drawSettingsButton(c: Canvas) {
+        p.style = Paint.Style.FILL
+        p.shader = settingsBg
+        c.drawRoundRect(settingsR, 14f, 14f, p)
+        p.shader = null
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 3f
+        p.color = PLATA_OSC
+        c.drawRoundRect(settingsR, 14f, 14f, p)
+        p.style = Paint.Style.FILL
+        p.shader = gearShader
+        c.drawPath(gearPath, p)
+        p.shader = null
+        // aro de acento alrededor del agujero
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        p.color = NARANJA
+        c.drawCircle(settingsR.centerX(), settingsR.centerY(), settingsR.height() * 0.38f * 0.52f, p)
     }
 
     /** Tira de luces como la de un volante GT3: se enciende con el acelerador. */
@@ -938,34 +1208,9 @@ class DashView(ctx: Context) : View(ctx) {
         p.typeface = fontCond; p.textSize = tag; p.color = PLATA
         c.drawText("FRENO", cx, r.bottom - 16f, p)
 
-        // barras por segmentos: verde sube, rojo baja
-        val n = 10
-        val step = halfLen / n
-        val gap = 5f
-        val bw = pw * 0.34f
-        for (i in 0 until n) {
-            tmp.set(cx - bw / 2f, trackCy - (i + 1) * step + gap / 2f, cx + bw / 2f, trackCy - i * step - gap / 2f)
-            p.color = if (gasV * n > i) VERDE_GT else 0xFF1B1F23.toInt()
-            c.drawRoundRect(tmp, 6f, 6f, p)
-            tmp.set(cx - bw / 2f, trackCy + i * step + gap / 2f, cx + bw / 2f, trackCy + (i + 1) * step - gap / 2f)
-            p.color = if (brakeV * n > i) ROJO_GT else 0xFF1B1F23.toInt()
-            c.drawRoundRect(tmp, 6f, 6f, p)
-        }
-
-        // perilla de aluminio
-        val ky = trackCy - pedal * halfLen
-        val kw = pw * 0.8f
-        tmp.set(cx - kw / 2f, ky - knobH / 2f, cx + kw / 2f, ky + knobH / 2f)
-        p.color = PLATA_OSC
-        c.drawRoundRect(tmp, 12f, 12f, p)
-        tmp.set(tmp.left + 4f, tmp.top + 4f, tmp.right - 4f, tmp.bottom - 4f)
-        p.color = PLATA
-        c.drawRoundRect(tmp, 9f, 9f, p)
-        p.style = Paint.Style.STROKE
-        p.strokeCap = Paint.Cap.BUTT
-        p.strokeWidth = 5f
-        p.color = NARANJA
-        c.drawLine(cx - kw / 2f + 14f, ky, cx + kw / 2f - 14f, ky, p)
+        drawBars(c, p, tmp, cx, trackCy, halfLen, pw * 0.34f, gasV, brakeV)
+        val sc = Cfg.knobScale / 100f
+        drawKnob(c, p, tmp, cx, trackCy - pedal * halfLen, min(pw * 0.8f * sc, pw * 0.94f), knobH * sc)
     }
 
     private fun button(c: Canvas, r: RectF, label: String, pressed: Boolean, textSize: Float, accent: Int) {
@@ -999,7 +1244,6 @@ class DashView(ctx: Context) : View(ctx) {
             when {
                 pedalR.contains(x, y) -> pedalId = e.getPointerId(i)
                 calR.contains(x, y) -> onCenter()
-                rangeR.contains(x, y) -> onRange()
                 settingsR.contains(x, y) -> onSettings()
             }
         }
